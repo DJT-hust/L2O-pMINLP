@@ -4,14 +4,19 @@ Parametric Mixed Integer Quadratic Microgrid Scheduling
 
 import numpy as np
 from pyomo import environ as pe
+import gurobipy as gp
 
-from src.problem.math_solver import abcParamSolver
+try:
+	from .abc_solver import abcParamSolver
+except ImportError:
+	from abc_solver import abcParamSolver
 
 
 class microgrid(abcParamSolver):
 	def __init__(
 			self,
 			horizon,
+			solver="gurobi",
 			p_gen_max=2.0,
 			p_ch_max=1.0,
 			p_dis_max=1.0,
@@ -28,13 +33,13 @@ class microgrid(abcParamSolver):
 			timelimit=None,
 	):
 		super().__init__(timelimit=timelimit, solver="gurobi")
-
+        
 		# create model
 		m = pe.ConcreteModel()
 		m.T = pe.RangeSet(0, horizon - 1)
 
 		# mutable parameters (parametric scenario input)
-		m.load = pe.Param(m.T, default=0.0, mutable=True)
+		m.p_load = pe.Param(m.T, default=0.0, mutable=True)
 		m.pv = pe.Param(m.T, default=0.0, mutable=True)
 		m.price_buy = pe.Param(m.T, default=0.0, mutable=True)
 		m.price_sell = pe.Param(m.T, default=0.0, mutable=True)
@@ -69,7 +74,7 @@ class microgrid(abcParamSolver):
 
 			# power balance: p_gen + p_dis - p_ch + p_grid + pv + s_load = load
 			m.cons.add(
-				m.p_gen[t] + m.p_dis[t] - m.p_ch[t] + m.p_grid[t] + m.pv[t] + m.s_load[t] == m.load[t]
+				m.p_gen[t] + m.p_dis[t] - m.p_ch[t] + m.p_grid[t] + m.pv[t] + m.s_load[t] == m.p_load[t]
 			)
 
 			# generator bounds linked with commitment
@@ -93,7 +98,7 @@ class microgrid(abcParamSolver):
 		# set attributes
 		self.model = m
 		self.params = {
-			"load": m.load,
+			"load": m.p_load,
 			"pv": m.pv,
 			"price_buy": m.price_buy,
 			"price_sell": m.price_sell,
@@ -117,7 +122,16 @@ class microgrid(abcParamSolver):
 
 if __name__ == "__main__":
 
-	from src.utlis import ms_test_solve
+	try:
+		from src.utlis import ms_test_solve
+	except ModuleNotFoundError:
+		import os
+		import sys
+
+		project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
+		if project_root not in sys.path:
+			sys.path.append(project_root)
+		from src.utlis import ms_test_solve
 
 	horizon = 24
 	rng = np.random.RandomState(17)

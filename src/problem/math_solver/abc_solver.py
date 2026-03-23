@@ -12,77 +12,144 @@ from pyomo import environ as pe
 from pyomo import opt as po
 from pyomo.core import TransformationFactory
 
+
 class abcParamSolver(ABC):
+
     @abstractmethod
     def __init__(self, solver="scip", timelimit=None):
-        # create a scip solver
-        self.solver = solver
-        self.opt = po.SolverFactory(solver)
-        # set timelimit
-        if timelimit:
-            if self.solver == "scip":
-                self.opt.options["limits/time"] = timelimit
-            elif self.solver == "gurobi":
-                self.opt.options["timelimit"] = timelimit
-            else:
-                raise ValueError("Solver '{}' does not support setting a time limit.".format(solver))
+        self.timelimit = timelimit
+        self.solver = self._resolve_solver_name(solver)
+
+        # ❌ 关键修改：不在 __init__ 创建 SolverFactory
+        self.opt = None
+
         # init attributes
-        self.model = None # pyomo model
-        self.params = {} # dict for pyomo mutable parameters
-        self.vars = {} # dict for pyomo decision variable
-        self.cons = None # pyomo constraints
-        self._has_warm_start = False # warm start
+        self.model = None
+        self.params = {}
+        self.vars = {}
+        self.cons = None
+        self.bin_ind = {}
+        self.int_ind = {}
+        self._has_warm_start = False
 
-    @property
-    def int_ind(self):
+    def _refresh_integrality_indices(self):
         """
-        Identify indices of integer variables
-        """
-        int_ind = {}
-        for key, vars in self.vars.items():
-            int_ind[key] = []
-            for i, v in vars.items():
-                if v.domain is pe.Integers:
-                    int_ind[key].append(i)
-        return int_ind
-
-    @property
-    def bin_ind(self):
-        """
-        Identify indices of binary variables
+        Refresh binary/integer variable index metadata from self.vars.
         """
         bin_ind = {}
-        for key, vars in self.vars.items():
-            bin_ind[key] = []
-            for i, v in vars.items():
-                if v.domain is pe.Binary:
-                    bin_ind[key].append(i)
-        return bin_ind
+        int_ind = {}
+
+        for key, var_comp in self.vars.items():
+            bin_pos = []
+            int_pos = []
+            for pos, idx in enumerate(var_comp):
+                var_data = var_comp[idx]
+                if var_data.is_binary():
+                    bin_pos.append(pos)
+                elif var_data.is_integer():
+                    int_pos.append(pos)
+            bin_ind[key] = bin_pos
+            int_ind[key] = int_pos
+
+        self.bin_ind = bin_ind
+        self.int_ind = int_ind
+
+    # ============================================================
+    # Solver availability / selection (保持不变)
+    # ============================================================
+
+    
+    def _is_solver_available(self, solver_name):
+        try:
+            solver = po.SolverFactory(solver_name)
+            if solver_name.endswith("_persistent"):
+                # ✅ persistent solver: existence is enough
+                return solver is not None
+            else:
+                # ✅ normal solver
+                return solver is not None and solver.available(False)
+        except Exception:
+            return False
+
+
+    def _resolve_solver_name(self, solver_name):
+    
+        # ------------------------------------------------
+        # Case 1: user explicitly specifies solver
+        # ------------------------------------------------
+        if solver_name != "auto":
+            if not self._is_solver_available(solver_name):
+                raise ValueError(f"Solver '{solver_name}' is not available.")
+            return solver_name
+    
+        # ------------------------------------------------
+        # Case 2: auto selection (IMPORTANT ORDER)
+        # ------------------------------------------------
+        preferred = [
+            "gurobi_persistent",  # ✅ FIRST: WLS-safe
+            "gurobi",             # fallback (non-WLS or env-var based)
+            "scip",
+            "highs",
+            "cbc",
+            "glpk",
+        ]
+    
+        for cand in preferred:
+            if self._is_solver_available(cand):
+                return cand
+    
+        raise ValueError(
+            "No available solver found. Please install one of: "
+            "gurobi_persistent, gurobi, scip, highs, cbc, glpk."
+        )
+
+    # ============================================================
+    # ✅ 新增：统一的 solver 创建入口（WLS 在这里锁死）
+    # ============================================================
+
+    
+    
+
+    def _create_solver(self):
+        # ✅ 强制 Python API（彻底绕开 GUROBI_RUN）
+        opt = po.SolverFactory("gurobi", solver_io="python")
+    
+        # ✅ 强制使用 WLS（这一行是关键）
+        # opt.options["UseWLS"] = 1
+    
+        if self.timelimit is not None:
+            opt.options["TimeLimit"] = self.timelimit
+    
+        return opt
+
+
+    # ============================================================
+    # ✅ 修改：solve() 中再创建 solver
+    # ============================================================
 
     def solve(self, tee=False, keepfiles=False, logfile=None):
-        """
-        Solve the model and return variable values and the objective value
-        """
-        # check logfile dir
-        if logfile:
-            Path(logfile).parent.mkdir(parents=True, exist_ok=True)
-        # clear value
+
+        # keep variable-type metadata in sync for downstream utilities
+        self._refresh_integrality_indices()
+
         if not self._has_warm_start:
             for var in self.model.component_objects(pe.Var, active=True):
                 for index in var:
                     var[index].value = None
-        # solve the model
-        if self.solver in ["gurobi", "cplex", "xpress"]:
-            self.res = self.opt.solve(self.model, warmstart=self._has_warm_start,
-                                      tee=tee, keepfiles=keepfiles, logfile=logfile)
-        else:
-            self.res = self.opt.solve(self.model, tee=tee, keepfiles=keepfiles,
-                                      logfile=logfile)
-        # reset warm start
+    
+        self.opt = self._create_solver()
+    
+        self.res = self.opt.solve(
+            self.model,
+            tee=tee,
+            keepfiles=keepfiles,
+            logfile=logfile
+        )
+    
         self._has_warm_start = False
-        # get variable values and objective value
-        xval, objval = self.get_val()
-        return xval, objval
+        return self.get_val()
+
+
 
     def set_param_val(self, param_dict):
         """
@@ -167,16 +234,28 @@ class abcParamSolver(ABC):
         """
         Creates and returns a deep copy of the model
         """
-        # shallow copy
-        model_new = copy.deepcopy(self)
-        # clone pyomo model
-        model_new.model = model_new.model.clone()
-        # clone variables
-        model_new.vars = {var: getattr(model_new.model, var) for var in self.vars}
+        # Avoid deepcopying solver/result handles (e.g., gurobi PyCapsule).
+        # Clone only the pyomo model and rebuild component references.
+        model_new = copy.copy(self)
+        model_new.model = self.model.clone()
+        # clone variables/parameters by component name to support alias keys
+        model_new.vars = {
+            key: getattr(model_new.model, comp.local_name)
+            for key, comp in self.vars.items()
+        }
         # clone constraints
-        model_new.cons = model_new.model.cons
+        model_new.cons = getattr(model_new.model, self.cons.local_name)
         # clone parameters
-        model_new.params = {param: getattr(model_new.model, param) for param in self.params}
+        model_new.params = {
+            key: getattr(model_new.model, comp.local_name)
+            for key, comp in self.params.items()
+        }
+        # reset solver/runtime state for cloned instance
+        model_new.opt = model_new._create_solver()
+        if hasattr(model_new, "res"):
+            model_new.res = None
+        model_new._has_warm_start = False
+        model_new._refresh_integrality_indices()
         return model_new
 
     def relax(self):

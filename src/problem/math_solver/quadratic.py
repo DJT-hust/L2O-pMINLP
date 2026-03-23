@@ -10,8 +10,8 @@ from pyomo import environ as pe
 from src.problem.math_solver import abcParamSolver
 
 class quadratic(abcParamSolver):
-    def __init__(self, num_var, num_ineq, timelimit=None):
-        super().__init__(timelimit=timelimit, solver="gurobi")
+    def __init__(self, num_var, num_ineq, timelimit=None, solver="auto"):
+        super().__init__(timelimit=timelimit, solver=solver)
         # fixed params
         rng = np.random.RandomState(17)
         Q = 0.01 * np.diag(rng.random(size=num_var))
