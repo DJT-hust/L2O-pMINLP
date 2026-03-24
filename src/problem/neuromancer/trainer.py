@@ -3,13 +3,20 @@ Training pipeline
 """
 
 import time
+from pathlib import Path
 
 import copy
 import torch
 
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except Exception:
+    SummaryWriter = None
+
 class trainer:
     def __init__(self, components, loss_fn, optimizer, epochs=100, growth_rate=1,
-                 patience=5, warmup=0, clip=100, loss_key="loss", device="cpu"):
+                 patience=5, warmup=0, clip=100, loss_key="loss", device="cpu",
+                 tensorboard=False, tb_logdir=None, tb_run_name="run"):
         """
         Initialize the Trainer class.
         """
@@ -27,6 +34,21 @@ class trainer:
         self.early_stop_counter = 0
         self.best_loss = float("inf")
         self.best_model_state = None
+        self.tensorboard = bool(tensorboard)
+        self.tb_logdir = tb_logdir
+        self.tb_run_name = tb_run_name
+        self.writer = None
+
+        if self.tensorboard:
+            if SummaryWriter is None:
+                print("[TensorBoard] Disabled: torch.utils.tensorboard is unavailable.")
+                self.tensorboard = False
+            else:
+                base_dir = Path(tb_logdir) if tb_logdir else Path("runs")
+                run_dir = base_dir / tb_run_name
+                run_dir.mkdir(parents=True, exist_ok=True)
+                self.writer = SummaryWriter(log_dir=str(run_dir))
+                print(f"[TensorBoard] Logging to {run_dir}")
 
     def train(self, loader_train, loader_dev):
         """
@@ -40,6 +62,9 @@ class trainer:
         with torch.no_grad():
             val_loss = self.best_loss = self.calculate_loss(loader_dev)
         print(f"Epoch 0, Iters {iters}, Validation Loss: {val_loss:.2f}")
+        if self.writer is not None:
+            self.writer.add_scalar("loss/val", val_loss, iters)
+            self.writer.add_scalar("penalty/weight", float(self.loss_fn.penalty_weight), iters)
         # init accumulate training loss
         train_loss_total = 0
         # training loop
@@ -70,6 +95,9 @@ class trainer:
                 iters += 1
                 if iters % 125 == 0:
                     stop_training = self.validate(epoch, iters, loader_dev, train_loss_total/125)
+                    if self.writer is not None:
+                        self.writer.add_scalar("loss/train", train_loss_total/125, iters)
+                        self.writer.add_scalar("penalty/weight", float(self.loss_fn.penalty_weight), iters)
                     # update penalty weight
                     self.loss_fn.penalty_weight *= self.growth_rate
                     # reset accumulated train loss
@@ -81,6 +109,9 @@ class trainer:
         elapsed = tock - tick
         print("Training complete.")
         print(f"The training time is {elapsed:.2f} sec.")
+        if self.writer is not None:
+            self.writer.flush()
+            self.writer.close()
 
     def validate(self, epoch, iters, loader_dev, train_loss):
         """
@@ -94,6 +125,8 @@ class trainer:
             # get loss
             val_loss = self.calculate_loss(loader_dev)
             print(f"Epoch {epoch}, Iters {iters}, Training Loss: {train_loss:.2f}, Validation Loss: {val_loss:.2f}")
+            if self.writer is not None:
+                self.writer.add_scalar("loss/val", val_loss, iters)
             # restore weight
             #self.loss_fn.penalty_weight = temp_weight
         # turn into training phase

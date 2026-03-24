@@ -7,7 +7,8 @@ Utlities
 import torch
 from src.problem.neuromancer.trainer import trainer
 
-def train(components, loss_fn, loader_train, loader_val, lr, penalty_growth):
+def train(components, loss_fn, loader_train, loader_val, lr, penalty_growth,
+          tensorboard=False, tb_logdir=None, tb_run_name="run"):
     epochs = 200                    # number of training epochs
     patience = 20                   # number of epochs with no improvement in eval metric to allow before early stopping
     if penalty_growth:
@@ -20,6 +21,7 @@ def train(components, loss_fn, loader_train, loader_val, lr, penalty_growth):
     # create a trainer for the problem
     my_trainer = trainer(components, loss_fn, optimizer, epochs=epochs,
                          growth_rate=growth_rate, patience=patience, warmup=warmup,
-                         device="cuda")
+                         device="cuda", tensorboard=tensorboard,
+                         tb_logdir=tb_logdir, tb_run_name=tb_run_name)
     # training for the rounding problem
     my_trainer.train(loader_train, loader_val)
