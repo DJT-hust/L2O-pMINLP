@@ -153,3 +153,6 @@ cython_debug/
 
 # WandB
 wandb/*
+
+# Experiment outputs
+result/
