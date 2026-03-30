@@ -142,25 +142,25 @@ class microgrid(abcParamSolver):
         self.cons = m.cons
 
         # ------------------------------------------------------------------
-        # pMINLP flattening scheme for learning (EXCLUDES p_grid)
-        # x = [p_grid_buy, p_grid_sell, p_gen, p_ch, p_dis, soc, s_load, u_gen, u_ch, u_dis]
-        # each block has length T; total nx = 10T
+        # pMINLP flattening scheme for learning (EXCLUDES p_grid and soc)
+        # SOC is derived from charge/discharge dynamics via _reconstruct_soc()
+        # x = [p_grid_buy, p_grid_sell, p_gen, p_ch, p_dis, s_load, u_gen, u_ch, u_dis]
+        # each block has length T; total nx = 9T
         # ------------------------------------------------------------------
         T = self.horizon
-        self.nx = 10 * T
+        self.nx = 9 * T
         self.x_slices = {
             "p_grid_buy": slice(0 * T, 1 * T),
             "p_grid_sell": slice(1 * T, 2 * T),
             "p_gen": slice(2 * T, 3 * T),
             "p_ch": slice(3 * T, 4 * T),
             "p_dis": slice(4 * T, 5 * T),
-            "soc": slice(5 * T, 6 * T),
-            "s_load": slice(6 * T, 7 * T),
-            "u_gen": slice(7 * T, 8 * T),
-            "u_ch": slice(8 * T, 9 * T),
-            "u_dis": slice(9 * T, 10 * T),
+            "s_load": slice(5 * T, 6 * T),
+            "u_gen": slice(6 * T, 7 * T),
+            "u_ch": slice(7 * T, 8 * T),
+            "u_dis": slice(8 * T, 9 * T),
         }
-        bin_inds = list(range(7 * T, 10 * T))  # u_gen,u_ch,u_dis
+        bin_inds = list(range(6 * T, 9 * T))  # u_gen,u_ch,u_dis
         # roundModel expects dict keyed by variable name, e.g. {"x": indices}
         self.bin_ind = {"x": bin_inds}
         self.int_ind = {"x": bin_inds}  # binaries are also integers
