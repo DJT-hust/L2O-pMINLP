@@ -18,6 +18,7 @@ class trainer:
                  patience=5, warmup=0, validate_every=125,
                  clip=100, loss_key="loss", scheduler=None, device="cpu",
                  train_eval_batches=8,
+                 loss_report_offset=0.0,
                  tensorboard=False, tb_logdir=None, tb_run_name="run"):
         """
         Initialize the Trainer class.
@@ -35,6 +36,7 @@ class trainer:
         self.loss_key = loss_key
         self.device = device
         self.train_eval_batches = max(0, int(train_eval_batches))
+        self.loss_report_offset = float(loss_report_offset)
         self.early_stop_counter = 0
         self.best_loss = float("inf")
         self.best_model_state = None
@@ -44,7 +46,6 @@ class trainer:
         self.writer = None
         self.loss_history = {
             "iters": [],
-            "train": [],
             "train_eval": [],
             "val": [],
             "test": [],
@@ -60,6 +61,11 @@ class trainer:
                 run_dir.mkdir(parents=True, exist_ok=True)
                 self.writer = SummaryWriter(log_dir=str(run_dir))
                 print(f"[TensorBoard] Logging to {run_dir}")
+
+    def _apply_loss_offset(self, loss_val):
+        if loss_val != loss_val:
+            return float("nan")
+        return float(loss_val) + self.loss_report_offset
 
     def train(self, loader_train, loader_dev, loader_test=None):
         """
@@ -77,7 +83,10 @@ class trainer:
                 loader_train,
                 max_batches=self.train_eval_batches if self.train_eval_batches > 0 else None,
             )
-        print(f"Epoch 0, Iters {iters}, Validation Loss: {val_loss:.2f}")
+        print(
+            f"Epoch 0, Iters {iters}, Train Eval Loss: {train_eval_loss:.2f}, "
+            f"Validation Loss: {val_loss:.2f}"
+        )
         if self.writer is not None:
             self.writer.add_scalar("loss/train_eval", train_eval_loss, iters)
             self.writer.add_scalar("loss/val", val_loss, iters)
@@ -85,8 +94,6 @@ class trainer:
                 self.writer.add_scalar("loss/test", test_loss, iters)
             self.writer.add_scalar("penalty/weight", float(self.loss_fn.penalty_weight), iters)
             self.writer.add_scalar("lr", float(self.optimizer.param_groups[0]["lr"]), iters)
-        # init accumulate training loss
-        train_loss_total = 0
         # training loop
         tick = time.time()
         for epoch in range(self.epochs):
@@ -106,14 +113,13 @@ class trainer:
                     data_dict.update(comp(data_dict))
                 data_dict = self.loss_fn(data_dict)
                 # backward pass
-                data_dict[self.loss_key].backward()
+                train_loss = data_dict[self.loss_key] + self.loss_report_offset
+                train_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.components.parameters(), self.clip)
                 self.optimizer.step()
                 if self.scheduler is not None:
                     self.scheduler.step()
                 self.optimizer.zero_grad()
-                # accumulate train loss
-                train_loss_total += data_dict[self.loss_key].item()
                 iters += 1
                 if iters % self.validate_every == 0:
                     stop_training = self.validate(
@@ -122,16 +128,12 @@ class trainer:
                         loader_train,
                         loader_dev,
                         loader_test,
-                        train_loss_total / self.validate_every,
                     )
                     if self.writer is not None:
-                        self.writer.add_scalar("loss/train", train_loss_total / self.validate_every, iters)
                         self.writer.add_scalar("penalty/weight", float(self.loss_fn.penalty_weight), iters)
                         self.writer.add_scalar("lr", float(self.optimizer.param_groups[0]["lr"]), iters)
                     # update penalty weight
                     self.loss_fn.penalty_weight *= self.growth_rate
-                    # reset accumulated train loss
-                    train_loss_total = 0
                     # early stop
                     if stop_training:
                         break
@@ -144,7 +146,7 @@ class trainer:
             self.writer.flush()
             self.writer.close()
 
-    def validate(self, epoch, iters, loader_train, loader_dev, loader_test, train_loss):
+    def validate(self, epoch, iters, loader_train, loader_dev, loader_test):
         """
         validation
         """
@@ -167,19 +169,17 @@ class trainer:
             
             if loader_test is not None:
                 print(
-                    f"Epoch {epoch}, Iters {iters}, Training Loss: {train_loss:.2f}, "
-                    f"Train Eval Loss: {train_eval_loss:.2f}, "
+                    f"Epoch {epoch}, Iters {iters}, Train Eval Loss: {train_eval_loss:.2f}, "
                     f"Validation Loss: {val_loss:.2f} (obj={val_obj:.2f}, viol={val_viol:.2f}), "
                     f"Test Loss: {test_loss:.2f} (obj={test_obj:.2f}, viol={test_viol:.2f})"
                 )
             else:
                 print(
-                    f"Epoch {epoch}, Iters {iters}, Training Loss: {train_loss:.2f}, "
-                    f"Train Eval Loss: {train_eval_loss:.2f}, Validation Loss: {val_loss:.2f}"
+                    f"Epoch {epoch}, Iters {iters}, Train Eval Loss: {train_eval_loss:.2f}, "
+                    f"Validation Loss: {val_loss:.2f}"
                 )
 
             self.loss_history["iters"].append(iters)
-            self.loss_history["train"].append(float(train_loss))
             self.loss_history["train_eval"].append(float(train_eval_loss))
             self.loss_history["val"].append(float(val_loss))
             self.loss_history["test"].append(float(test_loss))
@@ -229,7 +229,7 @@ class trainer:
                 data_dict.update(comp(data_dict))
             # get loss components
             result_dict = self.loss_fn(data_dict)
-            total_loss += result_dict[self.loss_key].item()
+            total_loss += (result_dict[self.loss_key] + self.loss_report_offset).item()
             num_batches += 1
         if num_batches == 0:
             return float("nan")
@@ -291,11 +291,9 @@ class trainer:
 
         eps = 1e-12
         iters = self.loss_history["iters"]
-        train_loss = [max(float(x), eps) for x in self.loss_history["train"]]
         train_eval_loss = [max(float(x), eps) for x in self.loss_history["train_eval"]]
         val_loss = [max(float(x), eps) for x in self.loss_history["val"]]
         plt.figure(figsize=(9, 5))
-        plt.plot(iters, train_loss, label="train_loss", linewidth=2)
         plt.plot(iters, train_eval_loss, label="train_eval_loss", linewidth=2)
         plt.plot(iters, val_loss, label="val_loss", linewidth=2)
 

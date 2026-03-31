@@ -275,9 +275,11 @@ def rndCls(loader_train, loader_test, loader_val, config, penalty_growth=False):
     Learned rounding via Gumbel (Classifier-style).
     """
     print(config)
-    np.random.seed(42)
-    torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
+    seed = int(getattr(config, "seed", 42))
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
     print(f"RC in Microgrid for horizon {config.horizon}.")
 
     import neuromancer as nm
@@ -361,6 +363,7 @@ def rndCls(loader_train, loader_test, loader_val, config, penalty_growth=False):
         warmup=getattr(config, "warmup", None),
         validate_every=getattr(config, "validate_every", 125),
         train_eval_batches=getattr(config, "train_eval_batches", 8),
+        loss_report_offset=getattr(config, "loss_report_offset", 0.0),
         lr_anneal=getattr(config, "lr_anneal", False),
         lr_min=getattr(config, "lr_min", 1e-6),
         loader_test=loader_test,
@@ -382,9 +385,11 @@ def rndThd(loader_train, loader_test, loader_val, config, penalty_growth=False):
     Learned rounding via learned thresholds.
     """
     print(config)
-    np.random.seed(42)
-    torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
+    seed = int(getattr(config, "seed", 42))
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
     print(f"LT in Microgrid for horizon {config.horizon}.")
 
     import neuromancer as nm
@@ -463,6 +468,7 @@ def rndThd(loader_train, loader_test, loader_val, config, penalty_growth=False):
         warmup=getattr(config, "warmup", None),
         validate_every=getattr(config, "validate_every", 125),
         train_eval_batches=getattr(config, "train_eval_batches", 8),
+        loss_report_offset=getattr(config, "loss_report_offset", 0.0),
         lr_anneal=getattr(config, "lr_anneal", False),
         lr_min=getattr(config, "lr_min", 1e-6),
         loader_test=loader_test,
@@ -484,9 +490,11 @@ def rndSte(loader_train, loader_test, loader_val, config, penalty_growth=False):
     STE rounding (no learned rounding network).
     """
     print(config)
-    np.random.seed(42)
-    torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
+    seed = int(getattr(config, "seed", 42))
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
     print(f"RS in Microgrid for horizon {config.horizon}.")
 
     import neuromancer as nm
@@ -559,6 +567,7 @@ def rndSte(loader_train, loader_test, loader_val, config, penalty_growth=False):
         warmup=getattr(config, "warmup", None),
         validate_every=getattr(config, "validate_every", 125),
         train_eval_batches=getattr(config, "train_eval_batches", 8),
+        loss_report_offset=getattr(config, "loss_report_offset", 0.0),
         lr_anneal=getattr(config, "lr_anneal", False),
         lr_min=getattr(config, "lr_min", 1e-6),
         loader_test=loader_test,
@@ -622,6 +631,16 @@ def evaluate(components, loss_fn, model, loader_test, project, config):
             "Solver baseline enabled: "
             f"timelimit={getattr(config, 'solver_time_limit', 60.0)}s, "
             f"tee={getattr(config, 'solver_tee', False)}"
+        )
+
+    policy_mc_samples = max(1, int(getattr(config, "policy_mc_samples", 1)))
+    policy_mc_noise = float(getattr(config, "policy_mc_noise", 0.0))
+    policy_mc_rng = np.random.RandomState(int(getattr(config, "policy_mc_seed", 123)))
+    mc_improve_count = 0
+    if policy_mc_samples > 1 and policy_mc_noise > 0.0:
+        print(
+            "[Eval] MC no-proj candidates enabled: "
+            f"samples={policy_mc_samples}, noise={policy_mc_noise}"
         )
 
     def _objective_from_x_numpy(x_vec, params):
@@ -706,6 +725,27 @@ def evaluate(components, loss_fn, model, loader_test, project, config):
         _, _, _, _, viol_arr = _evaluate_candidate_x(x_raw, params)
         return float(np.mean(viol_arr)), int(np.sum(viol_arr > 1e-6))
 
+    def _is_better_candidate(cand_a, cand_b, feas_guard):
+        """
+        Compare two evaluated candidates with feasibility-first preference.
+        cand tuple: (x, obj_pre, obj_post, obj, viol_arr)
+        """
+        _, _, _, obj_a, viol_a = cand_a
+        _, _, _, obj_b, viol_b = cand_b
+        mean_a = float(np.mean(viol_a))
+        mean_b = float(np.mean(viol_b))
+        num_a = int(np.sum(viol_a > 1e-6))
+        num_b = int(np.sum(viol_b > 1e-6))
+        feas_a = num_a == 0 and mean_a <= feas_guard
+        feas_b = num_b == 0 and mean_b <= feas_guard
+        if feas_a and not feas_b:
+            return True
+        if feas_b and not feas_a:
+            return False
+        if abs(mean_a - mean_b) > 1e-12:
+            return mean_a < mean_b
+        return obj_a <= obj_b
+
     # Contrast #2: evaluate all test samples when requested.
     N = len(loader_test.dataset) if getattr(config, "eval_all_test", False) else min(100, len(loader_test.dataset))
     if N < len(loader_test.dataset):
@@ -726,19 +766,20 @@ def evaluate(components, loss_fn, model, loader_test, project, config):
 
         # Keep pre-projection policy output for no-projection contrast.
         x_rnd_no_proj = dp["x_rnd"].detach().cpu().numpy().reshape(-1).copy()
+        sample_params = {
+            "load": dp["load"].detach().cpu().numpy().tolist()[0],
+            "pv": dp["pv"].detach().cpu().numpy().tolist()[0],
+            "price_buy": dp["price_buy"].detach().cpu().numpy().tolist()[0],
+            "price_sell": dp["price_sell"].detach().cpu().numpy().tolist()[0],
+            "soc0": float(dp["soc0"].detach().cpu().numpy().reshape(-1)[0]),
+        }
 
         if project:
             # Conditional projection: only run projection when violation exceeds threshold.
             trigger_mean = getattr(config, "proj_trigger_mean_viol", 1e-3)
             no_proj_mean_viol_est, _ = _viol_summary_from_x_numpy(
                 x_rnd_no_proj,
-                {
-                    "load": dp["load"].detach().cpu().numpy().tolist()[0],
-                    "pv": dp["pv"].detach().cpu().numpy().tolist()[0],
-                    "price_buy": dp["price_buy"].detach().cpu().numpy().tolist()[0],
-                    "price_sell": dp["price_sell"].detach().cpu().numpy().tolist()[0],
-                    "soc0": float(dp["soc0"].detach().cpu().numpy().reshape(-1)[0]),
-                },
+                sample_params,
             )
             if no_proj_mean_viol_est > trigger_mean:
                 # projection uses autograd internally
@@ -747,13 +788,7 @@ def evaluate(components, loss_fn, model, loader_test, project, config):
         tock = time.time()
 
         # store params for csv readability
-        params_list.append({
-            "load": dp["load"].detach().cpu().numpy().tolist()[0],
-            "pv": dp["pv"].detach().cpu().numpy().tolist()[0],
-            "price_buy": dp["price_buy"].detach().cpu().numpy().tolist()[0],
-            "price_sell": dp["price_sell"].detach().cpu().numpy().tolist()[0],
-            "soc0": float(dp["soc0"].detach().cpu().numpy().reshape(-1)[0]),
-        })
+        params_list.append(sample_params)
 
         # assign params to Pyomo model
         model.set_param_val({
@@ -772,10 +807,16 @@ def evaluate(components, loss_fn, model, loader_test, project, config):
         )
 
         # no-projection contrast on the same sample
-        x_no_proj, obj_pre_balance_no_proj, obj_post_balance_no_proj, obj_no_proj, viol_no_proj = _evaluate_candidate_x(
-            x_rnd_no_proj,
-            params_list[-1],
-        )
+        no_proj_best = _evaluate_candidate_x(x_rnd_no_proj, params_list[-1])
+        if policy_mc_samples > 1 and policy_mc_noise > 0.0:
+            for _ in range(policy_mc_samples - 1):
+                x_try = x_rnd_no_proj + policy_mc_rng.normal(0.0, policy_mc_noise, size=x_rnd_no_proj.shape)
+                cand_try = _evaluate_candidate_x(x_try, params_list[-1])
+                if _is_better_candidate(cand_try, no_proj_best, float(getattr(config, "policy_feas_guard", 1e-4))):
+                    no_proj_best = cand_try
+                    mc_improve_count += 1
+
+        x_no_proj, obj_pre_balance_no_proj, obj_post_balance_no_proj, obj_no_proj, viol_no_proj = no_proj_best
 
         # Candidate selection for final reported policy metrics.
         select_mode = getattr(config, "policy_select", "best")
@@ -971,6 +1012,8 @@ def evaluate(components, loss_fn, model, loader_test, project, config):
         "Policy candidate selection counts (proj / no_proj): "
         f"{select_proj_count} / {select_no_proj_count}"
     )
+    if policy_mc_samples > 1 and policy_mc_noise > 0.0:
+        print(f"MC no-proj improvements accepted: {mc_improve_count}")
 
     # Contrast #1: projection vs no projection on identical test cases.
     if project and len(df) > 0:

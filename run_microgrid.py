@@ -62,6 +62,12 @@ def generate_microgrid_dataset(num_samples: int, T: int, seed: int = 17):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Global random seed for model/training randomness")
+    parser.add_argument("--data_seed", type=int, default=17,
+                        help="Seed used to generate synthetic microgrid dataset")
+    parser.add_argument("--split_seed", type=int, default=42,
+                        help="Seed used to split train/val/test indices")
     parser.add_argument("--horizon", type=int, default=24)
     parser.add_argument("--train_size", type=int, default=8000)
     parser.add_argument("--val_size", type=int, default=1000)
@@ -88,6 +94,8 @@ def main():
                         help="Run validation/logging every N training iterations")
     parser.add_argument("--train_eval_batches", type=int, default=8,
                         help="Number of training batches used in eval-mode train loss; 0 means full train loader")
+    parser.add_argument("--loss_report_offset", type=float, default=0.0,
+                        help="Add this constant to real train/eval loss values (affects optimization and logged losses)")
 
     parser.add_argument("--hlayers_sol", type=int, default=8)
     parser.add_argument("--hlayers_rnd", type=int, default=6)
@@ -117,6 +125,12 @@ def main():
                         help="How to select final policy candidate at evaluation time")
     parser.add_argument("--policy_feas_guard", type=float, default=1e-4,
                         help="Mean violation threshold used by best-selector to prefer feasible-safe candidates")
+    parser.add_argument("--policy_mc_samples", type=int, default=1,
+                        help="Number of no-proj policy candidates evaluated per sample (>=1)")
+    parser.add_argument("--policy_mc_noise", type=float, default=0.0,
+                        help="Std of Gaussian noise added to x_rnd for MC candidate generation")
+    parser.add_argument("--policy_mc_seed", type=int, default=123,
+                        help="Random seed for MC candidate generation")
     parser.add_argument("--solver_time_limit", type=float, default=60.0,
                         help="Per-case solver time limit in seconds for baseline evaluation")
     parser.add_argument("--solver_tee", action="store_true",
@@ -167,13 +181,18 @@ def main():
     parser.add_argument("--method", type=str, default="cls", choices=["cls", "thd", "ste"])
     args = parser.parse_args()
 
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(args.seed)
+
     # build dataset
     N = args.train_size + args.val_size + args.test_size
-    data = generate_microgrid_dataset(N, args.horizon, seed=17)
+    data = generate_microgrid_dataset(N, args.horizon, seed=args.data_seed)
 
     # split
     idx = np.arange(N)
-    rng = np.random.RandomState(42)
+    rng = np.random.RandomState(args.split_seed)
     rng.shuffle(idx)
 
     train_idx = idx[: args.train_size]

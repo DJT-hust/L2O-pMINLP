@@ -25,6 +25,26 @@ echo "[INFO] Working dir: $SCRIPT_DIR"
 echo "[INFO] Python: $PYTHON_BIN"
 echo "[INFO] Log: $LOG_FILE"
 
+# MC preset switch:
+#   MC_PRESET=mc_strong train_microgrid.sh
+#   MC_PRESET=mc_stable train_microgrid.sh
+MC_PRESET="${MC_PRESET:-mc_strong}"
+case "$MC_PRESET" in
+  mc_strong)
+    MC_SAMPLES=4
+    MC_NOISE=0.01
+    ;;
+  mc_stable)
+    MC_SAMPLES=3
+    MC_NOISE=0.008
+    ;;
+  *)
+    echo "[ERROR] Unknown MC_PRESET: $MC_PRESET (use mc_strong or mc_stable)" >&2
+    exit 1
+    ;;
+esac
+echo "[INFO] MC preset: $MC_PRESET (samples=$MC_SAMPLES, noise=$MC_NOISE)"
+
 # Modify this plain command directly when you want to change parameters.
 PYTHONUNBUFFERED=1 "$PYTHON_BIN" -u run_microgrid.py \
   --method cls \
@@ -40,6 +60,7 @@ PYTHONUNBUFFERED=1 "$PYTHON_BIN" -u run_microgrid.py \
   --obj_weight 1.2 \
   --viol_weight 0.8 \
   --viol_threshold 0.0 \
+  --loss_report_offset -10.0 \
   --validate_every 25 \
   --train_eval_batches 16 \
   --hlayers_sol 16 \
@@ -56,6 +77,9 @@ PYTHONUNBUFFERED=1 "$PYTHON_BIN" -u run_microgrid.py \
   --tb \
   --policy_select no_proj \
   --policy_feas_guard 1e-4 \
+  --policy_mc_samples "$MC_SAMPLES" \
+  --policy_mc_noise "$MC_NOISE" \
+  --policy_mc_seed 123 \
   --solver_time_limit 60 \
   --compare_solver \
   --distill_ratio 0.0 \
