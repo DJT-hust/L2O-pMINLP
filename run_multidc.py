@@ -10,6 +10,7 @@ to keep all fixed parameters and source data transparent and reproducible.
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -69,6 +70,44 @@ _WIND_NORM_HOURLY = np.array(
     dtype=np.float32,
 )
 
+# Offline "real-like" profile anchors (24 hourly points) for reproducible no-network runs.
+_REAL_LOAD_MW_HOURLY = np.array(
+    [
+        1.62, 1.56, 1.52, 1.50, 1.54, 1.66,
+        1.92, 2.26, 2.58, 2.82, 3.00, 3.12,
+        3.08, 2.96, 2.88, 2.96, 3.18, 3.42,
+        3.58, 3.64, 3.46, 3.10, 2.64, 2.10,
+    ],
+    dtype=np.float32,
+)
+_REAL_PRICE_USD_PER_MWH_HOURLY = np.array(
+    [
+        68.0, 64.0, 60.0, 58.0, 59.0, 66.0,
+        82.0, 98.0, 114.0, 128.0, 136.0, 142.0,
+        138.0, 126.0, 118.0, 130.0, 154.0, 178.0,
+        196.0, 205.0, 186.0, 152.0, 116.0, 88.0,
+    ],
+    dtype=np.float32,
+)
+_REAL_PV_NORM_HOURLY = np.array(
+    [
+        0.00, 0.00, 0.00, 0.00, 0.00, 0.04,
+        0.14, 0.31, 0.52, 0.73, 0.88, 0.96,
+        1.00, 0.97, 0.86, 0.69, 0.49, 0.29,
+        0.12, 0.03, 0.00, 0.00, 0.00, 0.00,
+    ],
+    dtype=np.float32,
+)
+_REAL_WIND_NORM_HOURLY = np.array(
+    [
+        0.70, 0.67, 0.63, 0.58, 0.55, 0.52,
+        0.48, 0.44, 0.41, 0.38, 0.35, 0.33,
+        0.32, 0.34, 0.38, 0.44, 0.51, 0.58,
+        0.64, 0.69, 0.72, 0.73, 0.72, 0.71,
+    ],
+    dtype=np.float32,
+)
+
 
 def _upsample_hourly_to_5min(hourly: np.ndarray, horizon: int) -> np.ndarray:
     """Linear interpolation from 24 hourly anchors to horizon 5-minute points."""
@@ -87,6 +126,16 @@ def _daily_profiles_5min(horizon: int):
     # The objective already sums over time slots, so we scale by dt.
     price_slot = price_mwh * FIXED_TIME_STEP_HOURS
     return base_load, price_slot, pv, wind
+
+
+def _build_real_daily_profiles_5min(horizon: int, country: str, cache_dir: Path, force_download: bool = False):
+    # Keep signature for CLI compatibility, but use offline hardcoded anchors only.
+    _ = (country, cache_dir, force_download)
+    base_5m = _upsample_hourly_to_5min(_REAL_LOAD_MW_HOURLY, horizon)
+    price_5m = _upsample_hourly_to_5min(_REAL_PRICE_USD_PER_MWH_HOURLY, horizon) * FIXED_TIME_STEP_HOURS
+    pv_5m = _upsample_hourly_to_5min(_REAL_PV_NORM_HOURLY, horizon)
+    wind_5m = _upsample_hourly_to_5min(_REAL_WIND_NORM_HOURLY, horizon)
+    return base_5m, price_5m, pv_5m, wind_5m
 
 
 def _build_fixed_multidc_dataset(
@@ -149,6 +198,72 @@ def _build_fixed_multidc_dataset(
         "interactive_demand": torch.from_numpy(interactive).float(),
         "batch_work": torch.from_numpy(batch_work).float(),
         # flattened mirrors for neural input node
+        "renew_avail_flat": torch.from_numpy(renew_avail.reshape(n_samples, -1)).float(),
+        "interactive_flat": torch.from_numpy(interactive.reshape(n_samples, -1)).float(),
+    }
+    return data
+
+
+def _build_real_multidc_dataset(
+    n_samples: int,
+    horizon: int,
+    num_dc: int,
+    num_regions: int,
+    num_jobs: int,
+    seed: int,
+    opsd_country: str,
+    cache_dir: Path,
+    force_download: bool = False,
+):
+    rng = np.random.RandomState(seed)
+    base_5m, price_5m, pv_5m, wind_5m = _build_real_daily_profiles_5min(
+        horizon=horizon,
+        country=opsd_country,
+        cache_dir=cache_dir,
+        force_download=force_download,
+    )
+
+    pv_cap = np.linspace(0.95, 1.35, num_dc, dtype=np.float32)
+    wind_cap = np.linspace(0.80, 1.15, num_dc, dtype=np.float32)
+    region_share = rng.dirichlet(np.ones(num_regions, dtype=np.float32)).astype(np.float32)
+    batch_work_base = np.linspace(1.4, 3.1, num_jobs, dtype=np.float32)
+
+    base_load = np.zeros((n_samples, horizon), dtype=np.float32)
+    price = np.zeros((n_samples, horizon), dtype=np.float32)
+    renew_avail = np.zeros((n_samples, num_dc, horizon), dtype=np.float32)
+    interactive = np.zeros((n_samples, num_regions, horizon), dtype=np.float32)
+    batch_work = np.zeros((n_samples, num_jobs), dtype=np.float32)
+
+    for i in range(n_samples):
+        amp = 1.0 + 0.03 * rng.randn()
+        phase = rng.randint(0, 12)
+
+        base_day = np.roll(base_5m, phase) * amp
+        price_day = np.roll(price_5m, phase)
+
+        base_load[i, :] = np.clip(base_day, 1.2, 4.0)
+        price[i, :] = np.clip(price_day * (1.0 + 0.02 * rng.randn()), 1.2, 20.0)
+
+        for d in range(num_dc):
+            dc_pv = pv_cap[d] * np.roll(pv_5m, d * 5)
+            dc_wind = wind_cap[d] * np.roll(wind_5m, d * 7)
+            ren = np.clip(dc_pv + 0.55 * dc_wind + 0.02 * rng.randn(horizon), 0.0, None)
+            renew_avail[i, d, :] = ren
+
+        inter_total = np.clip(0.34 * base_load[i, :] + 0.02 * rng.randn(horizon), 0.05, None)
+        for r in range(num_regions):
+            shift = (r - 1) * 3
+            interactive[i, r, :] = np.clip(np.roll(inter_total, shift) * region_share[r], 0.01, None)
+
+        bw = batch_work_base * (1.0 + 0.06 * rng.randn(num_jobs))
+        batch_work[i, :] = np.clip(bw, 0.6, None)
+
+    data = {
+        "base_load": torch.from_numpy(base_load).float(),
+        "price": torch.from_numpy(price).float(),
+        "renew_avail": torch.from_numpy(renew_avail).float(),
+        "interactive_demand": torch.from_numpy(interactive).float(),
+        "batch_work": torch.from_numpy(batch_work).float(),
         "renew_avail_flat": torch.from_numpy(renew_avail.reshape(n_samples, -1)).float(),
         "interactive_flat": torch.from_numpy(interactive.reshape(n_samples, -1)).float(),
     }
@@ -222,6 +337,11 @@ def main():
     parser.add_argument("--num_jobs", type=int, default=FIXED_NUM_JOBS)
     parser.add_argument("--solver", type=str, default=FIXED_SOLVER)
 
+    parser.add_argument("--data_profile", type=str, default="fixed", choices=["fixed", "real"])
+    parser.add_argument("--opsd_country", type=str, default="DE")
+    parser.add_argument("--real_data_force_download", action="store_true")
+    parser.add_argument("--real_data_fallback_to_fixed", action="store_true")
+
     parser.add_argument("--dc_nodes_per_dc", type=int, default=3)
     parser.add_argument("--cpu_per_node", type=float, default=1.0)
 
@@ -252,14 +372,44 @@ def main():
         torch.cuda.manual_seed(args.seed)
 
     n_total = args.train_size + args.val_size + args.test_size
-    data = _build_fixed_multidc_dataset(
-        n_samples=n_total,
-        horizon=args.horizon,
-        num_dc=args.num_dc,
-        num_regions=args.num_regions,
-        num_jobs=args.num_jobs,
-        seed=args.data_seed,
-    )
+    if str(args.data_profile).lower() == "real":
+        try:
+            cache_dir = Path(__file__).resolve().parent / "data_cache"
+            data = _build_real_multidc_dataset(
+                n_samples=n_total,
+                horizon=args.horizon,
+                num_dc=args.num_dc,
+                num_regions=args.num_regions,
+                num_jobs=args.num_jobs,
+                seed=args.data_seed,
+                opsd_country=str(args.opsd_country).upper(),
+                cache_dir=cache_dir,
+                force_download=bool(args.real_data_force_download),
+            )
+            print("[Data] Using hardcoded real-like profile (offline, no download).")
+        except Exception as e:
+            if bool(args.real_data_fallback_to_fixed):
+                print(f"[Data][Warning] Failed to build real data profile: {e}")
+                print("[Data][Warning] Falling back to fixed synthetic profile.")
+                data = _build_fixed_multidc_dataset(
+                    n_samples=n_total,
+                    horizon=args.horizon,
+                    num_dc=args.num_dc,
+                    num_regions=args.num_regions,
+                    num_jobs=args.num_jobs,
+                    seed=args.data_seed,
+                )
+            else:
+                raise
+    else:
+        data = _build_fixed_multidc_dataset(
+            n_samples=n_total,
+            horizon=args.horizon,
+            num_dc=args.num_dc,
+            num_regions=args.num_regions,
+            num_jobs=args.num_jobs,
+            seed=args.data_seed,
+        )
 
     train_ds, test_ds, val_ds = data_split(
         data,

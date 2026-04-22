@@ -60,6 +60,21 @@ class multiDC(abcParamSolver):
         v_max_sq: float = 1.0e3,
         dc_reactive_factor: float = 0.23,
         line_flow_abs_max: float = 20.0,
+        mu_service: Sequence[float] | None = None,
+        v_latency_factor: Sequence[float] | None = None,
+        p_idle_it: Sequence[float] | None = None,
+        p_peak_it: Sequence[float] | None = None,
+        p_other_dc: Sequence[float] | None = None,
+        p_cool_slope: Sequence[float] | None = None,
+        p_cool_bias: Sequence[float] | None = None,
+        r_th: Sequence[float] | None = None,
+        c_th: Sequence[float] | None = None,
+        h_cool_max: Sequence[float] | None = None,
+        theta_min: Sequence[float] | None = None,
+        theta_max: Sequence[float] | None = None,
+        theta_init: Sequence[float] | None = None,
+        tout_profile: np.ndarray | None = None,
+        dc_power_factor: Sequence[float] | None = None,
     ):
         super().__init__(timelimit=timelimit, solver=solver)
 
@@ -207,6 +222,33 @@ class multiDC(abcParamSolver):
 
         self.line_flow_abs_max = np.full(self.num_branch, float(line_flow_abs_max), dtype=float)
 
+        # Parameters for enhanced internal data-center model (PDF Sec. 3.7).
+        self.mu_service = np.asarray(mu_service if mu_service is not None else [0.95] * self.num_dc, dtype=float)
+        self.v_latency_factor = np.asarray(v_latency_factor if v_latency_factor is not None else [2.0] * self.num_dc, dtype=float)
+        self.p_idle_it = np.asarray(p_idle_it if p_idle_it is not None else [0.10] * self.num_dc, dtype=float)
+        self.p_peak_it = np.asarray(p_peak_it if p_peak_it is not None else [0.35] * self.num_dc, dtype=float)
+        self.p_other_dc = np.asarray(p_other_dc if p_other_dc is not None else [0.08] * self.num_dc, dtype=float)
+        self.p_cool_slope = np.asarray(p_cool_slope if p_cool_slope is not None else [0.80] * self.num_dc, dtype=float)
+        self.p_cool_bias = np.asarray(p_cool_bias if p_cool_bias is not None else [0.02] * self.num_dc, dtype=float)
+        self.r_th = np.asarray(r_th if r_th is not None else [0.6] * self.num_dc, dtype=float)
+        self.c_th = np.asarray(c_th if c_th is not None else [3.2] * self.num_dc, dtype=float)
+        self.h_cool_max = np.asarray(h_cool_max if h_cool_max is not None else [3.0] * self.num_dc, dtype=float)
+        self.theta_min = np.asarray(theta_min if theta_min is not None else [18.0] * self.num_dc, dtype=float)
+        self.theta_max = np.asarray(theta_max if theta_max is not None else [28.0] * self.num_dc, dtype=float)
+        self.theta_init = np.asarray(theta_init if theta_init is not None else [23.0] * self.num_dc, dtype=float)
+        self.dc_power_factor = np.asarray(dc_power_factor if dc_power_factor is not None else [0.95] * self.num_dc, dtype=float)
+
+        if tout_profile is None:
+            tgrid = np.linspace(0.0, 2.0 * np.pi, self.horizon, endpoint=False)
+            tout_profile = 26.0 + 4.0 * np.sin(tgrid - np.pi / 3.0)
+            tout_profile = np.tile(tout_profile.reshape(1, -1), (self.num_dc, 1))
+        self.tout_profile = np.asarray(tout_profile, dtype=float)
+        if self.tout_profile.shape != (self.num_dc, self.horizon):
+            raise ValueError("tout_profile must have shape [num_dc, horizon].")
+
+        dt_hour = 5.0 / 60.0
+        self.kappa = np.exp(-dt_hour / np.maximum(self.r_th * self.c_th, 1.0e-4))
+
         p_sum = max(1e-6, float(np.sum(self.ieee33_p_bus_mw)))
         q_sum = max(1e-6, float(np.sum(self.ieee33_q_bus_mvar)))
         self.p_base_share = self.ieee33_p_bus_mw / p_sum
@@ -272,6 +314,31 @@ class multiDC(abcParamSolver):
         m.f = pe.Var(m.J, m.D, m.T, domain=pe.NonNegativeReals)
         m.delta = pe.Var(m.J, domain=pe.Binary)
 
+        # Enhanced internal data-center operation variables (Sec. 3.7).
+        m.aI = pe.Var(m.D, m.K, m.T, domain=pe.Binary)
+        m.aB = pe.Var(m.D, m.K, m.T, domain=pe.Binary)
+        m.rI = pe.Var(m.D, m.K, m.T, domain=pe.Binary)
+        m.rB = pe.Var(m.D, m.K, m.T, domain=pe.Binary)
+        m.wI = pe.Var(m.D, m.K, m.T, domain=pe.Binary)
+        m.wB = pe.Var(m.D, m.K, m.T, domain=pe.Binary)
+
+        m.mIM = pe.Var(m.D, m.T, domain=pe.NonNegativeReals)
+        m.mBM = pe.Var(m.D, m.T, domain=pe.NonNegativeReals)
+        m.mIR = pe.Var(m.D, m.T, domain=pe.NonNegativeReals)
+        m.mBR = pe.Var(m.D, m.T, domain=pe.NonNegativeReals)
+        m.mIP = pe.Var(m.D, m.T, domain=pe.NonNegativeReals)
+        m.mBP = pe.Var(m.D, m.T, domain=pe.NonNegativeReals)
+        m.FB = pe.Var(m.D, m.T, domain=pe.NonNegativeReals)
+
+        m.p_it_m = pe.Var(m.D, m.T, domain=pe.NonNegativeReals)
+        m.p_it_h = pe.Var(m.D, m.T, domain=pe.NonNegativeReals)
+        m.p_it = pe.Var(m.D, m.T, domain=pe.NonNegativeReals)
+        m.h = pe.Var(m.D, m.T, domain=pe.NonNegativeReals)
+        m.p_c = pe.Var(m.D, m.T, domain=pe.NonNegativeReals)
+        m.theta = pe.Var(m.D, m.T, domain=pe.Reals)
+        m.p_dc = pe.Var(m.D, m.T, domain=pe.NonNegativeReals)
+        m.q_dc = pe.Var(m.D, m.T, domain=pe.Reals)
+
         # Auxiliary variables for linearized switching/migration costs.
         m.eta = pe.Var(m.D, m.T, domain=pe.NonNegativeReals)
         m.nu = pe.Var(m.D, m.K, m.T, domain=pe.NonNegativeReals)
@@ -317,10 +384,14 @@ class multiDC(abcParamSolver):
 
         m.cons = pe.ConstraintList()
 
+        def _interactive_load_expr(d, t):
+            return sum(self.phi_interactive[r] * m.interactive[r, t] * m.xI[r, d, t] for r in m.R)
+
+        def _batch_proc_expr(d, t):
+            return sum(m.f[j, d, t] for j in m.J)
+
         def _dc_power_expr(d, t):
-            li_expr = sum(self.phi_interactive[r] * m.interactive[r, t] * m.xI[r, d, t] for r in m.R)
-            batch_expr = sum(m.f[j, d, t] for j in m.J)
-            return self.dc_idle_power[d] * m.y[d, t] + self.alpha_interactive * li_expr + self.alpha_batch * batch_expr
+            return m.p_dc[d, t]
 
         def _node_count_expr(d, t):
             return sum(m.on[d, k, t] for k in range(int(self.num_nodes_per_dc[d])))
@@ -367,8 +438,8 @@ class multiDC(abcParamSolver):
                 for k in range(int(self.num_nodes_per_dc[d]), self.max_nodes_per_dc):
                     m.cons.add(m.on[d, k, t] == 0.0)
 
-                li_expr = sum(self.phi_interactive[r] * m.interactive[r, t] * m.xI[r, d, t] for r in m.R)
-                batch_expr = sum(m.f[j, d, t] for j in m.J)
+                li_expr = _interactive_load_expr(d, t)
+                batch_expr = _batch_proc_expr(d, t)
 
                 m.cons.add(li_expr + batch_expr <= self.cpu_per_node[d] * _node_count_expr(d, t))
 
@@ -376,6 +447,88 @@ class multiDC(abcParamSolver):
                     m.cons.add(m.xI[r, d, t] <= m.y[d, t])
                 for j in m.J:
                     m.cons.add(m.z[j, d, t] <= m.y[d, t])
+
+        # Enhanced internal data-center operation model (approximate linearized version of PDF Sec. 3.7).
+        for d in m.D:
+            n_nodes = int(self.num_nodes_per_dc[d])
+            for t in m.T:
+                li_expr = _interactive_load_expr(d, t)
+                batch_expr = _batch_proc_expr(d, t)
+
+                # Total processed batch workload at DC d, time t.
+                m.cons.add(m.FB[d, t] == batch_expr)
+
+                # Node role consistency and peak-mode coupling.
+                for k in range(n_nodes):
+                    m.cons.add(m.aI[d, k, t] + m.aB[d, k, t] + m.rI[d, k, t] + m.rB[d, k, t] <= m.on[d, k, t])
+                    m.cons.add(m.wI[d, k, t] <= m.aI[d, k, t] + m.rI[d, k, t])
+                    m.cons.add(m.wB[d, k, t] <= m.aB[d, k, t] + m.rB[d, k, t])
+
+                # Aggregate service-state counts.
+                m.cons.add(m.mIM[d, t] == sum(m.aI[d, k, t] for k in range(n_nodes)))
+                m.cons.add(m.mBM[d, t] == sum(m.aB[d, k, t] for k in range(n_nodes)))
+                m.cons.add(m.mIR[d, t] == sum(m.rI[d, k, t] for k in range(n_nodes)))
+                m.cons.add(m.mBR[d, t] == sum(m.rB[d, k, t] for k in range(n_nodes)))
+                m.cons.add(m.mIP[d, t] == sum(m.wI[d, k, t] for k in range(n_nodes)))
+                m.cons.add(m.mBP[d, t] == sum(m.wB[d, k, t] for k in range(n_nodes)))
+
+                # Minimum service constraints.
+                coef_i = float(self.mu_service[d] - 1.0 / max(self.v_latency_factor[d], 1.0e-4))
+                m.cons.add(li_expr <= coef_i * m.mIM[d, t])
+                m.cons.add(m.FB[d, t] <= float(self.mu_service[d]) * m.mBM[d, t])
+
+                # Role feasibility constraints.
+                m.cons.add(m.mIM[d, t] + m.mBM[d, t] + m.mIR[d, t] + m.mBR[d, t] <= _node_count_expr(d, t))
+                m.cons.add(m.mIP[d, t] <= m.mIM[d, t] + m.mIR[d, t])
+                m.cons.add(m.mBP[d, t] <= m.mBM[d, t] + m.mBR[d, t])
+
+                # IT power model (kept convex/linear for robust MILP solving).
+                n_den = float(max(n_nodes, 1))
+                mu_d = float(max(self.mu_service[d], 1.0e-4))
+                e_i = float(self.p_idle_it[d])
+                e_p = float(self.p_peak_it[d])
+
+                m.cons.add(
+                    m.p_it_m[d, t]
+                    == e_i * (m.mIM[d, t] + m.mBM[d, t])
+                    + (e_p - e_i) / mu_d * (li_expr + m.FB[d, t])
+                    + float(self.p_idle_it[d]) * (m.mIM[d, t] + m.mBM[d, t]) / n_den
+                )
+                m.cons.add(
+                    m.p_it_h[d, t]
+                    == e_i * (m.mIR[d, t] + m.mBR[d, t])
+                    + (e_p - e_i) * (m.mIP[d, t] + m.mBP[d, t])
+                    + float(self.p_idle_it[d]) * (m.mIR[d, t] + m.mBR[d, t]) / n_den
+                )
+                m.cons.add(m.p_it[d, t] == m.p_it_m[d, t] + m.p_it_h[d, t])
+                m.cons.add(m.p_it[d, t] <= float(self.p_peak_it[d]) * _node_count_expr(d, t))
+
+                # Cooling and thermal dynamics.
+                m.cons.add(m.p_c[d, t] == float(self.p_cool_slope[d]) * m.h[d, t] + float(self.p_cool_bias[d]))
+
+                if int(t) == 0:
+                    theta_prev = float(self.theta_init[d])
+                else:
+                    theta_prev = m.theta[d, int(t) - 1]
+                kappa = float(self.kappa[d])
+                tout = float(self.tout_profile[d, int(t)])
+                rfac = float(self.r_th[d])
+                m.cons.add(
+                    m.theta[d, t]
+                    == kappa * theta_prev
+                    + (1.0 - kappa) * tout
+                    + rfac * (1.0 - kappa) * (m.p_it[d, t] + float(self.p_other_dc[d]) - m.h[d, t])
+                )
+
+                m.cons.add(m.h[d, t] <= float(self.h_cool_max[d]))
+                m.cons.add(m.theta[d, t] >= float(self.theta_min[d]))
+                m.cons.add(m.theta[d, t] <= float(self.theta_max[d]))
+
+                # Total active/reactive data-center power.
+                m.cons.add(m.p_dc[d, t] == m.p_it[d, t] + m.p_c[d, t] + float(self.p_other_dc[d]))
+                pf_d = float(np.clip(self.dc_power_factor[d], 0.7, 0.9999))
+                tanphi = float(np.tan(np.arccos(pf_d)))
+                m.cons.add(m.q_dc[d, t] == tanphi * m.p_dc[d, t])
 
         # DistFlow: voltage and branch balance over IEEE33 radial network.
         for t in m.T:
@@ -408,8 +561,8 @@ class multiDC(abcParamSolver):
 
                 dc_terms = [d for d in range(self.num_dc) if int(self.dc_bus_map[d]) == n]
                 if len(dc_terms) > 0:
-                    p_dc_n = sum(_dc_power_expr(d, t) - m.ren_use[d, t] for d in dc_terms)
-                    q_dc_n = sum(self.dc_reactive_factor * _dc_power_expr(d, t) for d in dc_terms)
+                    p_dc_n = sum(m.p_dc[d, t] - m.ren_use[d, t] for d in dc_terms)
+                    q_dc_n = sum(m.q_dc[d, t] for d in dc_terms)
                 else:
                     p_dc_n = 0.0
                     q_dc_n = 0.0
@@ -474,11 +627,33 @@ class multiDC(abcParamSolver):
             "v": m.v,
             "ren_use": m.ren_use,
             "y": m.y,
+            "s": m.on,
             "on": m.on,
             "xI": m.xI,
             "z": m.z,
             "f": m.f,
             "delta": m.delta,
+            "aI": m.aI,
+            "aB": m.aB,
+            "rI": m.rI,
+            "rB": m.rB,
+            "wI": m.wI,
+            "wB": m.wB,
+            "mIM": m.mIM,
+            "mBM": m.mBM,
+            "mIR": m.mIR,
+            "mBR": m.mBR,
+            "mIP": m.mIP,
+            "mBP": m.mBP,
+            "FB": m.FB,
+            "p_it_m": m.p_it_m,
+            "p_it_h": m.p_it_h,
+            "p_it": m.p_it,
+            "h": m.h,
+            "p_c": m.p_c,
+            "theta": m.theta,
+            "p_dc": m.p_dc,
+            "q_dc": m.q_dc,
             "eta": m.eta,
             "nu": m.nu,
             "mI": m.mI,

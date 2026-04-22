@@ -49,6 +49,15 @@ class penaltyLoss(nn.Module):
         v_max_sq,
         dc_reactive_factor,
         num_nodes_per_dc=None,
+        mu_service=None,
+        v_latency_factor=None,
+        p_idle_it=None,
+        p_peak_it=None,
+        p_other_dc=None,
+        p_cool_slope=None,
+        p_cool_bias=None,
+        h_cool_max=None,
+        dc_power_factor=None,
         penalty_weight: float = 40.0,
         eq_weight: float = 1.0,
         obj_weight: float = 1.0,
@@ -87,6 +96,33 @@ class penaltyLoss(nn.Module):
         self.register_buffer("deadlines", torch.as_tensor(deadlines, dtype=torch.long))
         self.register_buffer("dc_idle_power", torch.as_tensor(dc_idle_power, dtype=torch.float32))
         self.register_buffer("dc_cpu_cap", torch.as_tensor(dc_cpu_cap, dtype=torch.float32))
+        if mu_service is None:
+            mu_service = [0.95] * self.num_dc
+        if v_latency_factor is None:
+            v_latency_factor = [2.0] * self.num_dc
+        if p_idle_it is None:
+            p_idle_it = [0.10] * self.num_dc
+        if p_peak_it is None:
+            p_peak_it = [0.35] * self.num_dc
+        if p_other_dc is None:
+            p_other_dc = [0.08] * self.num_dc
+        if p_cool_slope is None:
+            p_cool_slope = [0.80] * self.num_dc
+        if p_cool_bias is None:
+            p_cool_bias = [0.02] * self.num_dc
+        if h_cool_max is None:
+            h_cool_max = [3.0] * self.num_dc
+        if dc_power_factor is None:
+            dc_power_factor = [0.95] * self.num_dc
+        self.register_buffer("mu_service", torch.as_tensor(mu_service, dtype=torch.float32))
+        self.register_buffer("v_latency_factor", torch.as_tensor(v_latency_factor, dtype=torch.float32))
+        self.register_buffer("p_idle_it", torch.as_tensor(p_idle_it, dtype=torch.float32))
+        self.register_buffer("p_peak_it", torch.as_tensor(p_peak_it, dtype=torch.float32))
+        self.register_buffer("p_other_dc", torch.as_tensor(p_other_dc, dtype=torch.float32))
+        self.register_buffer("p_cool_slope", torch.as_tensor(p_cool_slope, dtype=torch.float32))
+        self.register_buffer("p_cool_bias", torch.as_tensor(p_cool_bias, dtype=torch.float32))
+        self.register_buffer("h_cool_max", torch.as_tensor(h_cool_max, dtype=torch.float32))
+        self.register_buffer("dc_power_factor", torch.as_tensor(dc_power_factor, dtype=torch.float32))
         self.register_buffer("phi_interactive", torch.as_tensor(phi_interactive, dtype=torch.float32))
         self.register_buffer("switch_cost", torch.as_tensor(switch_cost, dtype=torch.float32))
         if num_nodes_per_dc is None:
@@ -159,6 +195,37 @@ class penaltyLoss(nn.Module):
         f = self._slice(x, "f").reshape(B, J, D, T)
         delta = self._slice(x, "delta")
         return p_th, u_th, p_grid, ren_use, y, xI, z, f, delta
+
+    def _compute_internal_dc_power(self, li: torch.Tensor, batch_proc: torch.Tensor, y: torch.Tensor):
+        # Smooth approximation of PDF internal DC model using predicted workload and activation.
+        # li, batch_proc, y: [B, D, T]
+        eps = 1.0e-6
+        cap_i = torch.clamp(self.mu_service - 1.0 / torch.clamp(self.v_latency_factor, min=eps), min=eps)
+        cap_i = cap_i.view(1, self.num_dc, 1)
+        mu = torch.clamp(self.mu_service, min=eps).view(1, self.num_dc, 1)
+        n_nodes = torch.clamp(self.num_nodes_per_dc, min=1.0).view(1, self.num_dc, 1)
+
+        active_nodes = torch.clamp(y, min=0.0, max=1.0) * n_nodes
+        mIM = torch.clamp(li / cap_i, min=0.0)
+        mBM = torch.clamp(batch_proc / mu, min=0.0)
+        mIR = torch.relu(active_nodes - mIM - mBM)
+        mBR = torch.zeros_like(mIR)
+        mIP = mIM
+        mBP = mBM
+
+        e_i = self.p_idle_it.view(1, self.num_dc, 1)
+        e_p = self.p_peak_it.view(1, self.num_dc, 1)
+        p_other = self.p_other_dc.view(1, self.num_dc, 1)
+
+        p_it_m = e_i * (mIM + mBM) + (e_p - e_i) / mu * (li + batch_proc) + e_i * (mIM + mBM) / n_nodes
+        p_it_h = e_i * (mIR + mBR) + (e_p - e_i) * (mIP + mBP) + e_i * (mIR + mBR) / n_nodes
+        p_it = torch.clamp(p_it_m + p_it_h, min=0.0)
+
+        h_raw = torch.clamp(0.6 * (p_it + p_other), min=0.0)
+        h_guess = torch.minimum(h_raw, self.h_cool_max.view(1, self.num_dc, 1))
+        p_c = self.p_cool_slope.view(1, self.num_dc, 1) * h_guess + self.p_cool_bias.view(1, self.num_dc, 1)
+        p_dc = torch.clamp(p_it + p_c + p_other, min=0.0)
+        return p_dc
 
     def cal_obj(self, input_dict):
         x = input_dict[self.x_key]
@@ -235,11 +302,7 @@ class penaltyLoss(nn.Module):
             * xI
         ).sum(dim=1)  # [B,D,T]
         batch_proc = f.sum(dim=1)  # [B,D,T]
-        p_dc = (
-            self.dc_idle_power.view(1, self.num_dc, 1) * y
-            + self.alpha_interactive * li
-            + self.alpha_batch * batch_proc
-        )
+        p_dc = self._compute_internal_dc_power(li, batch_proc, y)
 
         # DistFlow-derived feeder demand from bus loads.
         B = x.shape[0]

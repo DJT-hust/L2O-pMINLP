@@ -137,7 +137,13 @@ def _build_smap(config, in_dim: int, out_dim: int):
 
 
 def _build_reduced_x_layout(model):
-    """Build reduced decision layout by eliminating one DC column for equality-constrained xI and z."""
+    """Build reduced decision layout via equality-based elimination.
+
+    We remove variables that can be reconstructed exactly:
+    - xI, z: eliminate one DC column and recover by simplex equality.
+    - p_grid: recovered from root active-power balance equality.
+    - delta: fixed to 1.0 by hard completion regime.
+    """
     T = int(model.horizon)
     D = int(model.num_dc)
     R = int(model.num_regions)
@@ -158,18 +164,16 @@ def _build_reduced_x_layout(model):
     red_slices = {
         "p_th": alloc(T),
         "u_th": alloc(T),
-        "p_grid": alloc(T),
         "ren_use": alloc(D * T),
         "y": alloc(D * T),
         "xI_red": alloc(R * Dm1 * T),
         "z_red": alloc(J * Dm1 * T),
         "f": alloc(J * D * T),
-        "delta": alloc(J),
     }
     nx_red = offset
 
     bin_idx = []
-    for k in ["u_th", "y", "xI_red", "z_red", "delta"]:
+    for k in ["u_th", "y", "xI_red", "z_red"]:
         sl = red_slices[k]
         bin_idx.extend(list(range(sl.start, sl.stop)))
 
@@ -192,8 +196,27 @@ class _EqualityReconstructNode(nn.Module):
         self.register_buffer("dc_cpu_cap", torch.as_tensor(model.dc_cpu_cap, dtype=torch.float32))
         self.register_buffer("dc_idle_power", torch.as_tensor(model.dc_idle_power, dtype=torch.float32))
         self.register_buffer("phi_interactive", torch.as_tensor(model.phi_interactive, dtype=torch.float32))
+        self.register_buffer("p_base_share", torch.as_tensor(model.p_base_share, dtype=torch.float32))
+        self.register_buffer("dc_bus_map", torch.as_tensor(model.dc_bus_map, dtype=torch.long))
         self.alpha_interactive = float(model.alpha_interactive)
         self.alpha_batch = float(model.alpha_batch)
+        self.num_bus = int(model.num_bus)
+        self.num_dc = int(model.num_dc)
+        self.root_bus = int(model.root_bus)
+
+        # Cache topology in plain Python for fast subtree accumulation during reconstruction.
+        self._parent_edge_of_bus = [int(v) for v in model.parent_edge_of_bus]
+        self._branch_from = [int(v) for v in model.branch_from]
+        self._branch_to = [int(v) for v in model.branch_to]
+        self._children_edges_of_bus = [list(map(int, lst)) for lst in model.children_edges_of_bus]
+        self._postorder_nodes = []
+
+        def _dfs_post(u: int):
+            for e in self._children_edges_of_bus[u]:
+                _dfs_post(self._branch_to[e])
+            self._postorder_nodes.append(u)
+
+        _dfs_post(self.root_bus)
 
         valid = torch.zeros((self.J, self.T), dtype=torch.float32)
         for j in range(self.J):
@@ -202,13 +225,12 @@ class _EqualityReconstructNode(nn.Module):
             valid[j, rel : ddl + 1] = 1.0
         self.register_buffer("job_valid_mask", valid)
 
-    def forward(self, x_red, renew_avail, interactive_demand):
+    def forward(self, x_red, renew_avail, interactive_demand, base_load):
         B = x_red.shape[0]
         sl = self.red_slices
 
         p_th = x_red[:, sl["p_th"]]
         u_th = x_red[:, sl["u_th"]]
-        p_grid = x_red[:, sl["p_grid"]]
         ren_use_raw = x_red[:, sl["ren_use"]].reshape(B, self.D, self.T)
         y_4d = x_red[:, sl["y"]].reshape(B, self.D, self.T)
         y = y_4d.reshape(B, -1)
@@ -251,7 +273,36 @@ class _EqualityReconstructNode(nn.Module):
         )
 
         ren_upper = torch.minimum(torch.relu(renew_avail), torch.relu(p_dc))
-        ren_use = torch.minimum(torch.relu(ren_use_raw), ren_upper).reshape(B, -1)
+        ren_use_3d = torch.minimum(torch.relu(ren_use_raw), ren_upper)
+
+        # Enforce root active-power coupling equality exactly:
+        # p_sub(root) = p_th + p_grid. We reconstruct p_grid from feeder loads.
+        T = self.T
+        N = self.num_bus
+        p_load = self.p_base_share.view(1, N, 1) * base_load.unsqueeze(1)
+        for d in range(self.num_dc):
+            bus_idx = int(self.dc_bus_map[d].item())
+            p_load[:, bus_idx, :] = p_load[:, bus_idx, :] + p_dc[:, d, :] - ren_use_3d[:, d, :]
+
+        p_subtree = p_load.clone()
+        for n in self._postorder_nodes:
+            if n == self.root_bus:
+                continue
+            pe = self._parent_edge_of_bus[n]
+            if pe < 0:
+                continue
+            parent = self._branch_from[pe]
+            p_subtree[:, parent, :] = p_subtree[:, parent, :] + p_subtree[:, n, :]
+
+        root_children = self._children_edges_of_bus[self.root_bus]
+        p_sub_root = torch.zeros((B, T), dtype=x_red.dtype, device=x_red.device)
+        for e in root_children:
+            child = self._branch_to[e]
+            p_sub_root = p_sub_root + p_subtree[:, child, :]
+
+        p_grid = p_sub_root - p_th
+
+        ren_use = ren_use_3d.reshape(B, -1)
         delta = torch.ones((B, self.J), dtype=x_red.dtype, device=x_red.device)
 
         return torch.cat([p_th, u_th, p_grid, ren_use, y, xI_full, z_full, f, delta], dim=1)
@@ -263,7 +314,7 @@ def _build_reconstruct_node(model, red_slices):
     reconstruct = _EqualityReconstructNode(model, red_slices)
     return nm.system.Node(
         reconstruct,
-        ["x_red_rnd", "renew_avail", "interactive_demand"],
+        ["x_red_rnd", "renew_avail", "interactive_demand", "base_load"],
         ["x_rnd"],
         name="eq_reconstruct",
     )
@@ -307,6 +358,7 @@ def _multidc_constraint_labels(model):
     for j in range(J):
         rel = int(model.release_times[j])
         ddl = int(model.deadlines[j])
+        labels.append(f"batch_hard_complete[j={j}]")
         for t in range(T):
             if rel <= t <= ddl:
                 labels.append(f"batch_location_active[j={j},t={t}]")
@@ -318,12 +370,56 @@ def _multidc_constraint_labels(model):
 
     # Activation consistency and per-DC capacity.
     for d in range(D):
+        n_nodes = int(model.num_nodes_per_dc[d])
+        max_nodes = int(model.max_nodes_per_dc)
         for t in range(T):
+            labels.append(f"node_count_lb[d={d},t={t}]")
+            labels.append(f"node_count_ub[d={d},t={t}]")
+            for k in range(n_nodes, max_nodes):
+                labels.append(f"on_padding_zero[d={d},k={k},t={t}]")
             labels.append(f"dc_capacity[d={d},t={t}]")
             for r in range(R):
                 labels.append(f"interactive_requires_on[r={r},d={d},t={t}]")
             for j in range(J):
                 labels.append(f"batch_requires_on[j={j},d={d},t={t}]")
+
+    # Enhanced internal DC model constraints.
+    for d in range(D):
+        n_nodes = int(model.num_nodes_per_dc[d])
+        for t in range(T):
+            labels.append(f"fb_def[d={d},t={t}]")
+
+            for k in range(n_nodes):
+                labels.append(f"role_sum_le_on[d={d},k={k},t={t}]")
+                labels.append(f"peak_i_feas[d={d},k={k},t={t}]")
+                labels.append(f"peak_b_feas[d={d},k={k},t={t}]")
+
+            labels.append(f"mIM_sum[d={d},t={t}]")
+            labels.append(f"mBM_sum[d={d},t={t}]")
+            labels.append(f"mIR_sum[d={d},t={t}]")
+            labels.append(f"mBR_sum[d={d},t={t}]")
+            labels.append(f"mIP_sum[d={d},t={t}]")
+            labels.append(f"mBP_sum[d={d},t={t}]")
+
+            labels.append(f"min_service_interactive[d={d},t={t}]")
+            labels.append(f"min_service_batch[d={d},t={t}]")
+
+            labels.append(f"role_feas_total[d={d},t={t}]")
+            labels.append(f"role_feas_peak_i[d={d},t={t}]")
+            labels.append(f"role_feas_peak_b[d={d},t={t}]")
+
+            labels.append(f"pit_m_def[d={d},t={t}]")
+            labels.append(f"pit_h_def[d={d},t={t}]")
+            labels.append(f"pit_sum[d={d},t={t}]")
+            labels.append(f"pit_ub[d={d},t={t}]")
+
+            labels.append(f"pc_def[d={d},t={t}]")
+            labels.append(f"theta_dyn[d={d},t={t}]")
+            labels.append(f"h_ub[d={d},t={t}]")
+            labels.append(f"theta_lb[d={d},t={t}]")
+            labels.append(f"theta_ub[d={d},t={t}]")
+            labels.append(f"pdc_def[d={d},t={t}]")
+            labels.append(f"qdc_def[d={d},t={t}]")
 
     # DistFlow constraints.
     for t in range(T):
@@ -355,6 +451,16 @@ def _multidc_constraint_labels(model):
         for t in range(1, T):
             labels.append(f"switch_pos[d={d},t={t}]")
             labels.append(f"switch_neg[d={d},t={t}]")
+
+    # Node-level switching auxiliaries.
+    for d in range(D):
+        n_nodes = int(model.num_nodes_per_dc[d])
+        for k in range(n_nodes):
+            labels.append(f"node_switch_init_pos[d={d},k={k}]")
+            labels.append(f"node_switch_init_neg[d={d},k={k}]")
+            for t in range(1, T):
+                labels.append(f"node_switch_pos[d={d},k={k},t={t}]")
+                labels.append(f"node_switch_neg[d={d},k={k},t={t}]")
 
     for t in range(1, T):
         for r in range(R):
@@ -555,6 +661,22 @@ def _hard_binarize_policy_x(model, x_policy: np.ndarray, threshold: float = 0.5)
                     z_oh[j, best[j, t], t] = 1.0
         x[sl] = z_oh.reshape(-1)
 
+    # Couple activation with assignment hardening:
+    # if any interactive/batch task is assigned to (d,t), force y[d,t]=1.
+    if "y" in model.x_slices:
+        y_sl = model.x_slices["y"]
+        y_h = x[y_sl].reshape(D, T)
+
+        if "xI" in model.x_slices:
+            xi = x[model.x_slices["xI"]].reshape(R, D, T)
+            y_h = np.maximum(y_h, (np.sum(xi, axis=0) > 0.5).astype(float))
+
+        if "z" in model.x_slices:
+            z = x[model.x_slices["z"]].reshape(J, D, T)
+            y_h = np.maximum(y_h, (np.sum(z, axis=0) > 0.5).astype(float))
+
+        x[y_sl] = y_h.reshape(-1)
+
     # Hard-constraint regime: every job must be completed.
     if "delta" in model.x_slices:
         sl = model.x_slices["delta"]
@@ -643,17 +765,153 @@ def _assign_policy_solution_for_violation(model, x_policy: np.ndarray):
     )
 
     p_dc = np.zeros((D, T), dtype=float)
+    q_dc = np.zeros((D, T), dtype=float)
+    li_mat = np.zeros((D, T), dtype=float)
+    fb_mat = np.zeros((D, T), dtype=float)
     for d in range(D):
         for t in range(T):
             li = 0.0
             for r in range(R):
                 li += float(model.phi_interactive[r]) * interactive[r, t] * xI[r, d, t]
-            batch_proc = float(np.sum(f[:, d, t]))
-            p_dc[d, t] = (
-                float(model.dc_idle_power[d]) * y[d, t]
-                + float(model.alpha_interactive) * li
-                + float(model.alpha_batch) * batch_proc
-            )
+            li_mat[d, t] = li
+            fb_mat[d, t] = float(np.sum(f[:, d, t]))
+
+    # If enhanced PDF internal-model variables exist, build a feasible internal operating point.
+    has_internal = all(
+        k in model.vars
+        for k in [
+            "aI", "aB", "rI", "rB", "wI", "wB",
+            "mIM", "mBM", "mIR", "mBR", "mIP", "mBP",
+            "FB", "p_it_m", "p_it_h", "p_it", "h", "p_c", "theta", "p_dc", "q_dc",
+        ]
+    )
+
+    if has_internal:
+        for d in range(D):
+            n_nodes = int(model.num_nodes_per_dc[d]) if hasattr(model, "num_nodes_per_dc") else 1
+            mu_d = float(model.mu_service[d]) if hasattr(model, "mu_service") else 0.95
+            v_lat_d = float(model.v_latency_factor[d]) if hasattr(model, "v_latency_factor") else 2.0
+            cap_i = max(mu_d - 1.0 / max(v_lat_d, 1.0e-6), 1.0e-4)
+
+            e_i = float(model.p_idle_it[d]) if hasattr(model, "p_idle_it") else 0.10
+            e_p = float(model.p_peak_it[d]) if hasattr(model, "p_peak_it") else 0.35
+            p_other = float(model.p_other_dc[d]) if hasattr(model, "p_other_dc") else 0.08
+            cool_a = float(model.p_cool_slope[d]) if hasattr(model, "p_cool_slope") else 0.8
+            cool_b = float(model.p_cool_bias[d]) if hasattr(model, "p_cool_bias") else 0.02
+            r_th = float(model.r_th[d]) if hasattr(model, "r_th") else 0.6
+            kappa = float(model.kappa[d]) if hasattr(model, "kappa") else 0.95
+            h_max = float(model.h_cool_max[d]) if hasattr(model, "h_cool_max") else 3.0
+            theta_min = float(model.theta_min[d]) if hasattr(model, "theta_min") else 18.0
+            theta_max = float(model.theta_max[d]) if hasattr(model, "theta_max") else 28.0
+            theta_prev = float(model.theta_init[d]) if hasattr(model, "theta_init") else 23.0
+            pf_d = float(model.dc_power_factor[d]) if hasattr(model, "dc_power_factor") else 0.95
+            tanphi = float(np.tan(np.arccos(np.clip(pf_d, 0.7, 0.9999))))
+
+            for t in range(T):
+                li = float(li_mat[d, t])
+                fb = float(fb_mat[d, t])
+                n_on = 0
+                if "on" in model.vars:
+                    n_on = int(
+                        np.round(
+                            sum(float(model.vars["on"][d, k, t].value) for k in range(n_nodes))
+                        )
+                    )
+                n_on = max(0, min(n_on, n_nodes))
+
+                mIM = int(min(n_on, np.ceil(li / cap_i))) if li > 1.0e-9 else 0
+                rem = max(0, n_on - mIM)
+                mBM = int(min(rem, np.ceil(fb / max(mu_d, 1.0e-6)))) if fb > 1.0e-9 else 0
+                rem = max(0, rem - mBM)
+                mIR = rem
+                mBR = 0
+                mIP = min(mIM + mIR, mIM if li > 1.0e-9 else 0)
+                mBP = min(mBM + mBR, mBM if fb > 1.0e-9 else 0)
+
+                roles = ["off"] * n_nodes
+                ptr = 0
+                for _ in range(mIM):
+                    roles[ptr] = "aI"
+                    ptr += 1
+                for _ in range(mBM):
+                    roles[ptr] = "aB"
+                    ptr += 1
+                for _ in range(mIR):
+                    roles[ptr] = "rI"
+                    ptr += 1
+                for _ in range(mBR):
+                    roles[ptr] = "rB"
+                    ptr += 1
+
+                wi_left = mIP
+                wb_left = mBP
+                for k in range(n_nodes):
+                    rk = roles[k]
+                    ai = 1.0 if rk == "aI" else 0.0
+                    ab = 1.0 if rk == "aB" else 0.0
+                    ri = 1.0 if rk == "rI" else 0.0
+                    rb = 1.0 if rk == "rB" else 0.0
+                    wi = 0.0
+                    wb = 0.0
+                    if wi_left > 0 and (ai > 0.5 or ri > 0.5):
+                        wi = 1.0
+                        wi_left -= 1
+                    if wb_left > 0 and (ab > 0.5 or rb > 0.5):
+                        wb = 1.0
+                        wb_left -= 1
+                    model.vars["aI"][d, k, t].set_value(ai)
+                    model.vars["aB"][d, k, t].set_value(ab)
+                    model.vars["rI"][d, k, t].set_value(ri)
+                    model.vars["rB"][d, k, t].set_value(rb)
+                    model.vars["wI"][d, k, t].set_value(wi)
+                    model.vars["wB"][d, k, t].set_value(wb)
+
+                model.vars["mIM"][d, t].set_value(float(mIM))
+                model.vars["mBM"][d, t].set_value(float(mBM))
+                model.vars["mIR"][d, t].set_value(float(mIR))
+                model.vars["mBR"][d, t].set_value(float(mBR))
+                model.vars["mIP"][d, t].set_value(float(mIP))
+                model.vars["mBP"][d, t].set_value(float(mBP))
+                model.vars["FB"][d, t].set_value(float(fb))
+
+                pit_m = e_i * (mIM + mBM) + (e_p - e_i) / max(mu_d, 1.0e-6) * (li + fb) + e_i * (mIM + mBM) / max(n_nodes, 1)
+                pit_h = e_i * (mIR + mBR) + (e_p - e_i) * (mIP + mBP) + e_i * (mIR + mBR) / max(n_nodes, 1)
+                pit = pit_m + pit_h
+
+                tout = float(model.tout_profile[d, t]) if hasattr(model, "tout_profile") else 26.0
+                theta_ref = 0.5 * (theta_min + theta_max)
+                denom = max(r_th * (1.0 - kappa), 1.0e-6)
+                h_req = pit + p_other + (kappa * theta_prev + (1.0 - kappa) * tout - theta_ref) / denom
+                h_t = float(np.clip(h_req, 0.0, h_max))
+                theta_t = kappa * theta_prev + (1.0 - kappa) * tout + r_th * (1.0 - kappa) * (pit + p_other - h_t)
+                theta_prev = theta_t
+
+                pc = cool_a * h_t + cool_b
+                pdc = pit + pc + p_other
+                qdc = tanphi * pdc
+
+                model.vars["p_it_m"][d, t].set_value(float(pit_m))
+                model.vars["p_it_h"][d, t].set_value(float(pit_h))
+                model.vars["p_it"][d, t].set_value(float(pit))
+                model.vars["h"][d, t].set_value(float(h_t))
+                model.vars["p_c"][d, t].set_value(float(pc))
+                model.vars["theta"][d, t].set_value(float(theta_t))
+                model.vars["p_dc"][d, t].set_value(float(pdc))
+                model.vars["q_dc"][d, t].set_value(float(qdc))
+
+                p_dc[d, t] = pdc
+                q_dc[d, t] = qdc
+    else:
+        for d in range(D):
+            for t in range(T):
+                li = float(li_mat[d, t])
+                batch_proc = float(fb_mat[d, t])
+                p_dc[d, t] = (
+                    float(model.dc_idle_power[d]) * y[d, t]
+                    + float(model.alpha_interactive) * li
+                    + float(model.alpha_batch) * batch_proc
+                )
+                q_dc[d, t] = float(model.dc_reactive_factor) * p_dc[d, t]
 
     N = int(model.num_bus)
     E = int(model.num_branch)
@@ -667,7 +925,7 @@ def _assign_policy_solution_for_violation(model, x_policy: np.ndarray):
     for d in range(D):
         bus_idx = int(model.dc_bus_map[d])
         p_load[bus_idx, :] += p_dc[d, :] - ren_use[d, :]
-        q_load[bus_idx, :] += float(model.dc_reactive_factor) * p_dc[d, :]
+        q_load[bus_idx, :] += q_dc[d, :]
 
     p_subtree = p_load.copy()
     q_subtree = q_load.copy()
@@ -904,6 +1162,15 @@ def rndCls(loader_train, loader_test, loader_val, config, penalty_growth=False):
         p_grid_max=model.p_grid_max,
         dc_idle_power=model.dc_idle_power,
         dc_cpu_cap=model.dc_cpu_cap,
+        mu_service=getattr(model, "mu_service", None),
+        v_latency_factor=getattr(model, "v_latency_factor", None),
+        p_idle_it=getattr(model, "p_idle_it", None),
+        p_peak_it=getattr(model, "p_peak_it", None),
+        p_other_dc=getattr(model, "p_other_dc", None),
+        p_cool_slope=getattr(model, "p_cool_slope", None),
+        p_cool_bias=getattr(model, "p_cool_bias", None),
+        h_cool_max=getattr(model, "h_cool_max", None),
+        dc_power_factor=getattr(model, "dc_power_factor", None),
         phi_interactive=model.phi_interactive,
         alpha_interactive=model.alpha_interactive,
         alpha_batch=model.alpha_batch,
