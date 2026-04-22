@@ -131,6 +131,12 @@ def main():
                         help="Std of Gaussian noise added to x_rnd for MC candidate generation")
     parser.add_argument("--policy_mc_seed", type=int, default=123,
                         help="Random seed for MC candidate generation")
+    parser.add_argument("--policy_tail_weight", type=float, default=0.0,
+                        help="Weight for tail-risk penalty in policy candidate selection")
+    parser.add_argument("--policy_tail_topk_ratio", type=float, default=0.1,
+                        help="Top-k ratio used to estimate tail-risk from per-timestep operating cost")
+    parser.add_argument("--policy_tail_shed_weight", type=float, default=0.0,
+                        help="Extra weight on load-shedding tail-risk inside candidate selection")
     parser.add_argument("--solver_time_limit", type=float, default=60.0,
                         help="Per-case solver time limit in seconds for baseline evaluation")
     parser.add_argument("--solver_tee", action="store_true",

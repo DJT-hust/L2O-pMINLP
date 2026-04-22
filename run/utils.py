@@ -14,8 +14,9 @@ def train(components, loss_fn, loader_train, loader_val, lr, penalty_growth,
           loss_report_offset=0.0,
           lr_anneal=False, lr_min=1e-6,
           loader_test=None,
-          tensorboard=False, tb_logdir=None, tb_run_name="run"):
-    epochs = 200                    # number of training epochs
+        tensorboard=False, tb_logdir=None, tb_run_name="run",
+        epochs=200):
+    epochs = int(epochs)            # number of training epochs
     if penalty_growth:
         growth_rate = 1.03          # growth rate of penalty weight (balance constraint satisfaction and objective)
         default_warmup = 50         # number of validation checks to wait before early stopping

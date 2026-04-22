@@ -9,7 +9,6 @@ NOTE:
 
 import numpy as np
 from pyomo import environ as pe
-import gurobipy as gp
 
 try:
     from .abc_solver import abcParamSolver

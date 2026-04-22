@@ -45,6 +45,64 @@ case "$MC_PRESET" in
 esac
 echo "[INFO] MC preset: $MC_PRESET (samples=$MC_SAMPLES, noise=$MC_NOISE)"
 
+# GAP preset switch:
+#   GAP_PRESET=base train_microgrid.sh
+#   GAP_PRESET=gap_balanced train_microgrid.sh
+#   GAP_PRESET=gap_aggressive train_microgrid.sh
+GAP_PRESET="${GAP_PRESET:-base}"
+case "$GAP_PRESET" in
+  base)
+    PENALTY=30.0
+    OBJ_WEIGHT=1.2
+    VIOL_WEIGHT=0.8
+    LOSS_REPORT_OFFSET=-10.0
+    POLICY_SELECT="no_proj"
+    POLICY_MC_SAMPLES="$MC_SAMPLES"
+    POLICY_MC_NOISE="$MC_NOISE"
+    DISTILL_RATIO=0.0
+    DISTILL_WEIGHT=0.0
+    PROJ_ITERS=200
+    PROJ_STEP=0.01
+    PROJ_TAIL_STEPS=0
+    PROJ_TAIL_WEIGHT=1.0
+    ;;
+  gap_balanced)
+    PENALTY=35.0
+    OBJ_WEIGHT=1.5
+    VIOL_WEIGHT=0.8
+    LOSS_REPORT_OFFSET=0.0
+    POLICY_SELECT="no_proj"
+    POLICY_MC_SAMPLES=8
+    POLICY_MC_NOISE=0.012
+    DISTILL_RATIO=0.02
+    DISTILL_WEIGHT=0.04
+    PROJ_ITERS=200
+    PROJ_STEP=0.01
+    PROJ_TAIL_STEPS=0
+    PROJ_TAIL_WEIGHT=1.0
+    ;;
+  gap_aggressive)
+    PENALTY=45.0
+    OBJ_WEIGHT=1.5
+    VIOL_WEIGHT=0.9
+    LOSS_REPORT_OFFSET=0.0
+    POLICY_SELECT="best"
+    POLICY_MC_SAMPLES=10
+    POLICY_MC_NOISE=0.012
+    DISTILL_RATIO=0.02
+    DISTILL_WEIGHT=0.03
+    PROJ_ITERS=50
+    PROJ_STEP=1e-3
+    PROJ_TAIL_STEPS=2
+    PROJ_TAIL_WEIGHT=1.05
+    ;;
+  *)
+    echo "[ERROR] Unknown GAP_PRESET: $GAP_PRESET (use base, gap_balanced, or gap_aggressive)" >&2
+    exit 1
+    ;;
+esac
+echo "[INFO] GAP preset: $GAP_PRESET (penalty=$PENALTY, obj_weight=$OBJ_WEIGHT, viol_weight=$VIOL_WEIGHT, policy_select=$POLICY_SELECT, mc_samples=$POLICY_MC_SAMPLES, mc_noise=$POLICY_MC_NOISE, distill_ratio=$DISTILL_RATIO, distill_weight=$DISTILL_WEIGHT, loss_offset=$LOSS_REPORT_OFFSET)"
+
 # Modify this plain command directly when you want to change parameters.
 PYTHONUNBUFFERED=1 "$PYTHON_BIN" -u run_microgrid.py \
   --method cls \
@@ -56,11 +114,11 @@ PYTHONUNBUFFERED=1 "$PYTHON_BIN" -u run_microgrid.py \
   --lr 1e-3 \
   --lr_anneal \
   --lr_min 1e-6 \
-  --penalty 30.0 \
-  --obj_weight 1.2 \
-  --viol_weight 0.8 \
+  --penalty "$PENALTY" \
+  --obj_weight "$OBJ_WEIGHT" \
+  --viol_weight "$VIOL_WEIGHT" \
   --viol_threshold 0.0 \
-  --loss_report_offset -10.0 \
+  --loss_report_offset "$LOSS_REPORT_OFFSET" \
   --validate_every 25 \
   --train_eval_batches 16 \
   --hlayers_sol 16 \
@@ -75,17 +133,24 @@ PYTHONUNBUFFERED=1 "$PYTHON_BIN" -u run_microgrid.py \
   --transformer_heads 4 \
   --tb_logdir runs \
   --tb \
-  --policy_select no_proj \
+  --policy_select "$POLICY_SELECT" \
   --policy_feas_guard 1e-4 \
-  --policy_mc_samples "$MC_SAMPLES" \
-  --policy_mc_noise "$MC_NOISE" \
+  --policy_mc_samples "$POLICY_MC_SAMPLES" \
+  --policy_mc_noise "$POLICY_MC_NOISE" \
   --policy_mc_seed 123 \
+  --policy_tail_weight 0.03 \
+  --policy_tail_topk_ratio 0.10 \
+  --policy_tail_shed_weight 0.50 \
   --solver_time_limit 60 \
   --compare_solver \
-  --distill_ratio 0.0 \
-  --distill_weight 0.0 \
+  --distill_ratio "$DISTILL_RATIO" \
+  --distill_weight "$DISTILL_WEIGHT" \
   --distill_time_limit 30 \
   --distill_seed 123 \
+  --proj_iters "$PROJ_ITERS" \
+  --proj_step "$PROJ_STEP" \
+  --proj_tail_steps "$PROJ_TAIL_STEPS" \
+  --proj_tail_weight "$PROJ_TAIL_WEIGHT" \
   --patience 9999 \
   --warmup 40 \
   --eval_all_test \

@@ -636,11 +636,20 @@ def evaluate(components, loss_fn, model, loader_test, project, config):
     policy_mc_samples = max(1, int(getattr(config, "policy_mc_samples", 1)))
     policy_mc_noise = float(getattr(config, "policy_mc_noise", 0.0))
     policy_mc_rng = np.random.RandomState(int(getattr(config, "policy_mc_seed", 123)))
+    policy_tail_weight = float(getattr(config, "policy_tail_weight", 0.0))
+    policy_tail_topk_ratio = float(getattr(config, "policy_tail_topk_ratio", 0.1))
+    policy_tail_shed_weight = float(getattr(config, "policy_tail_shed_weight", 0.0))
     mc_improve_count = 0
     if policy_mc_samples > 1 and policy_mc_noise > 0.0:
         print(
             "[Eval] MC no-proj candidates enabled: "
             f"samples={policy_mc_samples}, noise={policy_mc_noise}"
+        )
+    if policy_tail_weight > 0.0:
+        print(
+            "[Eval] Tail-risk selection enabled: "
+            f"weight={policy_tail_weight}, topk_ratio={policy_tail_topk_ratio}, "
+            f"shed_weight={policy_tail_shed_weight}"
         )
 
     def _objective_from_x_numpy(x_vec, params):
@@ -730,8 +739,42 @@ def evaluate(components, loss_fn, model, loader_test, project, config):
         Compare two evaluated candidates with feasibility-first preference.
         cand tuple: (x, obj_pre, obj_post, obj, viol_arr)
         """
-        _, _, _, obj_a, viol_a = cand_a
-        _, _, _, obj_b, viol_b = cand_b
+        x_a, _, _, obj_a, viol_a = cand_a
+        x_b, _, _, obj_b, viol_b = cand_b
+
+        def _tail_risk_score(x_vec, params):
+            s = model.x_slices
+            p_grid_buy = x_vec[s["p_grid_buy"]]
+            p_grid_sell = x_vec[s["p_grid_sell"]]
+            p_gen = x_vec[s["p_gen"]]
+            s_load = x_vec[s["s_load"]]
+            u_gen = x_vec[s["u_gen"]]
+            price_buy = np.asarray(params["price_buy"], dtype=float)
+            price_sell = np.asarray(params["price_sell"], dtype=float)
+
+            step_cost = (
+                price_buy * p_grid_buy
+                - price_sell * p_grid_sell
+                + model.gen_quad * (p_gen ** 2)
+                + model.gen_lin * p_gen
+                + model.gen_on_cost * u_gen
+                + model.load_shed_penalty * s_load
+            )
+            ratio = min(max(policy_tail_topk_ratio, 1e-6), 1.0)
+            k = max(1, int(np.ceil(step_cost.shape[0] * ratio)))
+            top_cost = np.partition(step_cost, -k)[-k:]
+            tail_cost = float(np.mean(top_cost))
+
+            if policy_tail_shed_weight > 0.0:
+                top_shed = np.partition(s_load, -k)[-k:]
+                tail_cost += float(policy_tail_shed_weight * np.mean(top_shed))
+            return tail_cost
+
+        def _robust_obj(x_vec, obj, params):
+            if policy_tail_weight <= 0.0:
+                return float(obj)
+            return float(obj) + float(policy_tail_weight) * _tail_risk_score(x_vec, params)
+
         mean_a = float(np.mean(viol_a))
         mean_b = float(np.mean(viol_b))
         num_a = int(np.sum(viol_a > 1e-6))
@@ -744,7 +787,9 @@ def evaluate(components, loss_fn, model, loader_test, project, config):
             return False
         if abs(mean_a - mean_b) > 1e-12:
             return mean_a < mean_b
-        return obj_a <= obj_b
+        robust_a = _robust_obj(x_a, obj_a, params_list[-1])
+        robust_b = _robust_obj(x_b, obj_b, params_list[-1])
+        return robust_a <= robust_b
 
     # Contrast #2: evaluate all test samples when requested.
     N = len(loader_test.dataset) if getattr(config, "eval_all_test", False) else min(100, len(loader_test.dataset))
@@ -856,12 +901,74 @@ def evaluate(components, loss_fn, model, loader_test, project, config):
             elif no_proj_feas and not proj_feas:
                 pick_proj = False
             elif proj_feas and no_proj_feas:
-                pick_proj = objval_proj <= obj_no_proj
+                if policy_tail_weight > 0.0:
+                    def _tail_risk_score(x_vec, params):
+                        s = model.x_slices
+                        p_grid_buy = x_vec[s["p_grid_buy"]]
+                        p_grid_sell = x_vec[s["p_grid_sell"]]
+                        p_gen = x_vec[s["p_gen"]]
+                        s_load = x_vec[s["s_load"]]
+                        u_gen = x_vec[s["u_gen"]]
+                        price_buy = np.asarray(params["price_buy"], dtype=float)
+                        price_sell = np.asarray(params["price_sell"], dtype=float)
+                        step_cost = (
+                            price_buy * p_grid_buy
+                            - price_sell * p_grid_sell
+                            + model.gen_quad * (p_gen ** 2)
+                            + model.gen_lin * p_gen
+                            + model.gen_on_cost * u_gen
+                            + model.load_shed_penalty * s_load
+                        )
+                        ratio = min(max(policy_tail_topk_ratio, 1e-6), 1.0)
+                        k = max(1, int(np.ceil(step_cost.shape[0] * ratio)))
+                        top_cost = np.partition(step_cost, -k)[-k:]
+                        tail_cost = float(np.mean(top_cost))
+                        if policy_tail_shed_weight > 0.0:
+                            top_shed = np.partition(s_load, -k)[-k:]
+                            tail_cost += float(policy_tail_shed_weight * np.mean(top_shed))
+                        return tail_cost
+
+                    robust_proj = float(objval_proj) + float(policy_tail_weight) * _tail_risk_score(x_proj, params_list[-1])
+                    robust_no_proj = float(obj_no_proj) + float(policy_tail_weight) * _tail_risk_score(x_no_proj, params_list[-1])
+                    pick_proj = robust_proj <= robust_no_proj
+                else:
+                    pick_proj = objval_proj <= obj_no_proj
             else:
                 if abs(proj_mean_viol - no_proj_mean_viol) > 1e-12:
                     pick_proj = proj_mean_viol < no_proj_mean_viol
                 else:
-                    pick_proj = objval_proj <= obj_no_proj
+                    if policy_tail_weight > 0.0:
+                        def _tail_risk_score(x_vec, params):
+                            s = model.x_slices
+                            p_grid_buy = x_vec[s["p_grid_buy"]]
+                            p_grid_sell = x_vec[s["p_grid_sell"]]
+                            p_gen = x_vec[s["p_gen"]]
+                            s_load = x_vec[s["s_load"]]
+                            u_gen = x_vec[s["u_gen"]]
+                            price_buy = np.asarray(params["price_buy"], dtype=float)
+                            price_sell = np.asarray(params["price_sell"], dtype=float)
+                            step_cost = (
+                                price_buy * p_grid_buy
+                                - price_sell * p_grid_sell
+                                + model.gen_quad * (p_gen ** 2)
+                                + model.gen_lin * p_gen
+                                + model.gen_on_cost * u_gen
+                                + model.load_shed_penalty * s_load
+                            )
+                            ratio = min(max(policy_tail_topk_ratio, 1e-6), 1.0)
+                            k = max(1, int(np.ceil(step_cost.shape[0] * ratio)))
+                            top_cost = np.partition(step_cost, -k)[-k:]
+                            tail_cost = float(np.mean(top_cost))
+                            if policy_tail_shed_weight > 0.0:
+                                top_shed = np.partition(s_load, -k)[-k:]
+                                tail_cost += float(policy_tail_shed_weight * np.mean(top_shed))
+                            return tail_cost
+
+                        robust_proj = float(objval_proj) + float(policy_tail_weight) * _tail_risk_score(x_proj, params_list[-1])
+                        robust_no_proj = float(obj_no_proj) + float(policy_tail_weight) * _tail_risk_score(x_no_proj, params_list[-1])
+                        pick_proj = robust_proj <= robust_no_proj
+                    else:
+                        pick_proj = objval_proj <= obj_no_proj
 
             if pick_proj:
                 x, obj_pre_balance, obj_post_balance, objval, viol_arr = (

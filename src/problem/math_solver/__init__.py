@@ -3,3 +3,4 @@ from src.problem.math_solver.quadratic import quadratic
 from src.problem.math_solver.nonconvex import nonconvex
 from src.problem.math_solver.rosenbrock import rosenbrock
 from src.problem.math_solver.microgrid import microgrid
+from src.problem.math_solver.multi_dc import multiDC

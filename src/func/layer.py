@@ -5,6 +5,92 @@ import torch
 from torch import nn
 
 
+def _multidc_split_xi(xi, horizon, num_dc, num_regions, num_jobs):
+    t = int(horizon)
+    d = int(num_dc)
+    r = int(num_regions)
+    j = int(num_jobs)
+
+    idx = 0
+    base_load = xi[:, idx : idx + t]
+    idx += t
+    price = xi[:, idx : idx + t]
+    idx += t
+
+    renew = xi[:, idx : idx + d * t].reshape(-1, d, t)
+    idx += d * t
+    interactive = xi[:, idx : idx + r * t].reshape(-1, r, t)
+    idx += r * t
+    batch_work = xi[:, idx : idx + j]
+    return base_load, price, renew, interactive, batch_work
+
+
+def _multidc_constraint_features(base_load, price, renew, interactive, batch_work):
+    """Constraint-aware per-timestep engineered features for Multi-DC policies."""
+    interactive_total = interactive.sum(dim=1)
+    renew_total = renew.sum(dim=1)
+    net_power_pressure = base_load + interactive_total - renew_total
+    price_weighted_pressure = price * net_power_pressure
+    batch_total_rep = batch_work.sum(dim=1, keepdim=True).repeat(1, base_load.shape[1])
+
+    return (
+        interactive_total,
+        renew_total,
+        net_power_pressure,
+        price_weighted_pressure,
+        batch_total_rep,
+    )
+
+
+class MultiDCMLPPolicy(nn.Module):
+    """MLP policy with optional constraint-aware feature injection."""
+
+    def __init__(
+        self,
+        horizon,
+        num_dc,
+        num_regions,
+        num_jobs,
+        input_dim,
+        hidden_dim,
+        depth,
+        out_dim,
+        dropout=0.2,
+        constraint_feat_inject=False,
+    ):
+        super().__init__()
+        self.horizon = int(horizon)
+        self.num_dc = int(num_dc)
+        self.num_regions = int(num_regions)
+        self.num_jobs = int(num_jobs)
+        self.constraint_feat_inject = bool(constraint_feat_inject)
+
+        extra_dim = 5 * self.horizon if self.constraint_feat_inject else 0
+        d = int(input_dim) + extra_dim
+
+        layers = []
+        for _ in range(max(1, int(depth))):
+            layers.append(nn.Linear(d, int(hidden_dim)))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(float(dropout)))
+            d = int(hidden_dim)
+        layers.append(nn.Linear(d, int(out_dim)))
+        self.net = nn.Sequential(*layers)
+
+    def _augment(self, xi):
+        if not self.constraint_feat_inject:
+            return xi
+        base_load, price, renew, interactive, batch_work = _multidc_split_xi(
+            xi, self.horizon, self.num_dc, self.num_regions, self.num_jobs
+        )
+        feats = _multidc_constraint_features(base_load, price, renew, interactive, batch_work)
+        feat_flat = torch.cat(list(feats), dim=1)
+        return torch.cat([xi, feat_flat], dim=1)
+
+    def forward(self, xi):
+        return self.net(self._augment(xi))
+
+
 class TemporalResidualBlock(nn.Module):
     """Dilated Conv1d residual block for sequence modeling."""
 
@@ -314,6 +400,438 @@ class DualHeadHybridTemporalPolicy(nn.Module):
             refine = self.refine_scale * torch.tanh(self.cross_refiner(x_pre))
             return x_pre + refine
         return x_pre
+
+
+class MultiDCLSTMPolicy(nn.Module):
+    """LSTM policy for flattened Multi-DC inputs."""
+
+    def __init__(
+        self,
+        horizon,
+        num_dc,
+        num_regions,
+        num_jobs,
+        out_dim,
+        hidden_dim=128,
+        num_layers=2,
+        dropout=0.1,
+        constraint_feat_inject=False,
+    ):
+        super().__init__()
+        self.horizon = int(horizon)
+        self.num_dc = int(num_dc)
+        self.num_regions = int(num_regions)
+        self.num_jobs = int(num_jobs)
+        self.out_dim = int(out_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.constraint_feat_inject = bool(constraint_feat_inject)
+
+        self.seq_in_dim = 2 + self.num_dc + self.num_regions + self.num_jobs
+        if self.constraint_feat_inject:
+            self.seq_in_dim += 5
+        self.in_proj = nn.Linear(self.seq_in_dim, self.hidden_dim)
+
+        layers = max(1, int(num_layers))
+        lstm_dropout = float(dropout) if layers > 1 else 0.0
+        self.lstm = nn.LSTM(
+            input_size=self.hidden_dim,
+            hidden_size=self.hidden_dim,
+            num_layers=layers,
+            batch_first=True,
+            dropout=lstm_dropout,
+        )
+
+        self.head = nn.Sequential(
+            nn.Linear(self.hidden_dim * self.horizon, self.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(self.hidden_dim, self.out_dim),
+        )
+
+    def _split_xi(self, xi):
+        return _multidc_split_xi(xi, self.horizon, self.num_dc, self.num_regions, self.num_jobs)
+
+    def forward(self, xi):
+        base_load, price, renew, interactive, batch_work = self._split_xi(xi)
+
+        # Build per-timestep features: [base_load, price, renew(D), interactive(R), batch_work(J)].
+        renew_t = renew.transpose(1, 2)
+        interactive_t = interactive.transpose(1, 2)
+        batch_t = batch_work.unsqueeze(1).repeat(1, self.horizon, 1)
+        seq = torch.cat(
+            [
+                base_load.unsqueeze(-1),
+                price.unsqueeze(-1),
+                renew_t,
+                interactive_t,
+                batch_t,
+            ],
+            dim=-1,
+        )
+
+        if self.constraint_feat_inject:
+            feats = _multidc_constraint_features(base_load, price, renew, interactive, batch_work)
+            feat_seq = torch.stack(feats, dim=-1)
+            seq = torch.cat([seq, feat_seq], dim=-1)
+
+        h = torch.relu(self.in_proj(seq))
+        h, _ = self.lstm(h)
+        h = h.reshape(h.shape[0], -1)
+        return self.head(h)
+
+
+class MultiDCRNNPolicy(nn.Module):
+    """Vanilla RNN policy for flattened Multi-DC inputs."""
+
+    def __init__(
+        self,
+        horizon,
+        num_dc,
+        num_regions,
+        num_jobs,
+        out_dim,
+        hidden_dim=128,
+        num_layers=2,
+        dropout=0.1,
+        constraint_feat_inject=False,
+    ):
+        super().__init__()
+        self.horizon = int(horizon)
+        self.num_dc = int(num_dc)
+        self.num_regions = int(num_regions)
+        self.num_jobs = int(num_jobs)
+        self.out_dim = int(out_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.constraint_feat_inject = bool(constraint_feat_inject)
+
+        self.seq_in_dim = 2 + self.num_dc + self.num_regions + self.num_jobs
+        if self.constraint_feat_inject:
+            self.seq_in_dim += 5
+        self.in_proj = nn.Linear(self.seq_in_dim, self.hidden_dim)
+
+        layers = max(1, int(num_layers))
+        rnn_dropout = float(dropout) if layers > 1 else 0.0
+        self.rnn = nn.RNN(
+            input_size=self.hidden_dim,
+            hidden_size=self.hidden_dim,
+            num_layers=layers,
+            batch_first=True,
+            nonlinearity="tanh",
+            dropout=rnn_dropout,
+        )
+
+        self.head = nn.Sequential(
+            nn.Linear(self.hidden_dim * self.horizon, self.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(self.hidden_dim, self.out_dim),
+        )
+
+    def _split_xi(self, xi):
+        return _multidc_split_xi(xi, self.horizon, self.num_dc, self.num_regions, self.num_jobs)
+
+    def forward(self, xi):
+        base_load, price, renew, interactive, batch_work = self._split_xi(xi)
+
+        renew_t = renew.transpose(1, 2)
+        interactive_t = interactive.transpose(1, 2)
+        batch_t = batch_work.unsqueeze(1).repeat(1, self.horizon, 1)
+        seq = torch.cat(
+            [
+                base_load.unsqueeze(-1),
+                price.unsqueeze(-1),
+                renew_t,
+                interactive_t,
+                batch_t,
+            ],
+            dim=-1,
+        )
+
+        if self.constraint_feat_inject:
+            feats = _multidc_constraint_features(base_load, price, renew, interactive, batch_work)
+            feat_seq = torch.stack(feats, dim=-1)
+            seq = torch.cat([seq, feat_seq], dim=-1)
+
+        h = torch.relu(self.in_proj(seq))
+        h, _ = self.rnn(h)
+        h = h.reshape(h.shape[0], -1)
+        return self.head(h)
+
+
+class MultiDCTCNPolicy(nn.Module):
+    """TCN-style policy for flattened Multi-DC inputs."""
+
+    def __init__(
+        self,
+        horizon,
+        num_dc,
+        num_regions,
+        num_jobs,
+        out_dim,
+        hidden_dim=128,
+        num_blocks=4,
+        dropout=0.1,
+        constraint_feat_inject=False,
+    ):
+        super().__init__()
+        self.horizon = int(horizon)
+        self.num_dc = int(num_dc)
+        self.num_regions = int(num_regions)
+        self.num_jobs = int(num_jobs)
+        self.out_dim = int(out_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.constraint_feat_inject = bool(constraint_feat_inject)
+
+        in_ch = 2 + self.num_dc + self.num_regions + self.num_jobs
+        if self.constraint_feat_inject:
+            in_ch += 5
+        self.input_proj = nn.Conv1d(in_ch, self.hidden_dim, kernel_size=1)
+        blocks = max(1, int(num_blocks))
+        self.blocks = nn.ModuleList(
+            [
+                TemporalResidualBlock(
+                    self.hidden_dim,
+                    dilation=2 ** (i % 4),
+                    dropout=float(dropout),
+                )
+                for i in range(blocks)
+            ]
+        )
+        self.head = nn.Sequential(
+            nn.Linear(self.hidden_dim * self.horizon, self.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(self.hidden_dim, self.out_dim),
+        )
+
+    def _split_xi(self, xi):
+        return _multidc_split_xi(xi, self.horizon, self.num_dc, self.num_regions, self.num_jobs)
+
+    def forward(self, xi):
+        base_load, price, renew, interactive, batch_work = self._split_xi(xi)
+
+        renew_t = renew.transpose(1, 2)
+        interactive_t = interactive.transpose(1, 2)
+        batch_t = batch_work.unsqueeze(1).repeat(1, self.horizon, 1)
+        seq = torch.cat(
+            [
+                base_load.unsqueeze(-1),
+                price.unsqueeze(-1),
+                renew_t,
+                interactive_t,
+                batch_t,
+            ],
+            dim=-1,
+        )
+
+        if self.constraint_feat_inject:
+            feats = _multidc_constraint_features(base_load, price, renew, interactive, batch_work)
+            feat_seq = torch.stack(feats, dim=-1)
+            seq = torch.cat([seq, feat_seq], dim=-1)
+        # [B,T,C] -> [B,C,T]
+        h = seq.transpose(1, 2)
+        h = self.input_proj(h)
+        for block in self.blocks:
+            h = block(h)
+        h = h.reshape(h.shape[0], -1)
+        return self.head(h)
+
+
+class MultiDCDualHeadMLPPolicy(nn.Module):
+    """Dual-head gated MLP policy with optional residual baseline."""
+
+    def __init__(
+        self,
+        input_dim,
+        out_dim,
+        hidden_dim=128,
+        depth=6,
+        dropout=0.2,
+        residual=False,
+        residual_scale=0.3,
+        horizon=288,
+        num_dc=3,
+        num_regions=3,
+        num_jobs=4,
+        constraint_feat_inject=False,
+    ):
+        super().__init__()
+        self.out_dim = int(out_dim)
+        self.residual = bool(residual)
+        self.residual_scale = float(residual_scale)
+        self.horizon = int(horizon)
+        self.num_dc = int(num_dc)
+        self.num_regions = int(num_regions)
+        self.num_jobs = int(num_jobs)
+        self.constraint_feat_inject = bool(constraint_feat_inject)
+
+        extra_dim = 5 * self.horizon if self.constraint_feat_inject else 0
+        layers = []
+        d = int(input_dim) + extra_dim
+        for _ in range(max(1, int(depth))):
+            layers.append(nn.Linear(d, int(hidden_dim)))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(float(dropout)))
+            d = int(hidden_dim)
+        self.backbone = nn.Sequential(*layers)
+
+        self.feas_head = nn.Linear(d, self.out_dim)
+        self.obj_head = nn.Linear(d, self.out_dim)
+        self.gate_head = nn.Sequential(
+            nn.Linear(d, max(8, d // 4)),
+            nn.ReLU(),
+            nn.Linear(max(8, d // 4), 1),
+        )
+
+        if self.residual:
+            self.base_head = nn.Sequential(
+                nn.Linear(int(input_dim) + extra_dim, int(hidden_dim)),
+                nn.ReLU(),
+                nn.Dropout(float(dropout)),
+                nn.Linear(int(hidden_dim), self.out_dim),
+            )
+        else:
+            self.base_head = None
+
+    def _augment(self, xi):
+        if not self.constraint_feat_inject:
+            return xi
+        base_load, price, renew, interactive, batch_work = _multidc_split_xi(
+            xi, self.horizon, self.num_dc, self.num_regions, self.num_jobs
+        )
+        feats = _multidc_constraint_features(base_load, price, renew, interactive, batch_work)
+        feat_flat = torch.cat(list(feats), dim=1)
+        return torch.cat([xi, feat_flat], dim=1)
+
+    def forward(self, xi):
+        x_aug = self._augment(xi)
+        h = self.backbone(x_aug)
+        feas = self.feas_head(h)
+        obj = self.obj_head(h)
+        gate = torch.sigmoid(self.gate_head(h))
+        delta = (1.0 - gate) * feas + gate * obj
+
+        if self.base_head is None:
+            return delta
+        base = self.base_head(x_aug)
+        return base + self.residual_scale * torch.tanh(delta)
+
+
+class MultiDCDualHeadTCNPolicy(nn.Module):
+    """Dual-head gated TCN policy with optional residual baseline."""
+
+    def __init__(
+        self,
+        horizon,
+        num_dc,
+        num_regions,
+        num_jobs,
+        out_dim,
+        hidden_dim=128,
+        num_blocks=4,
+        dropout=0.1,
+        residual=False,
+        residual_scale=0.3,
+        constraint_feat_inject=False,
+    ):
+        super().__init__()
+        self.horizon = int(horizon)
+        self.num_dc = int(num_dc)
+        self.num_regions = int(num_regions)
+        self.num_jobs = int(num_jobs)
+        self.out_dim = int(out_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.residual = bool(residual)
+        self.residual_scale = float(residual_scale)
+        self.constraint_feat_inject = bool(constraint_feat_inject)
+
+        in_ch = 2 + self.num_dc + self.num_regions + self.num_jobs
+        if self.constraint_feat_inject:
+            in_ch += 5
+        self.input_proj = nn.Conv1d(in_ch, self.hidden_dim, kernel_size=1)
+        blocks = max(1, int(num_blocks))
+        self.blocks = nn.ModuleList(
+            [
+                TemporalResidualBlock(
+                    self.hidden_dim,
+                    dilation=2 ** (i % 4),
+                    dropout=float(dropout),
+                )
+                for i in range(blocks)
+            ]
+        )
+
+        flat_dim = self.hidden_dim * self.horizon
+        self.feas_head = nn.Sequential(
+            nn.Linear(flat_dim, self.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(self.hidden_dim, self.out_dim),
+        )
+        self.obj_head = nn.Sequential(
+            nn.Linear(flat_dim, self.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(self.hidden_dim, self.out_dim),
+        )
+        self.gate_head = nn.Sequential(
+            nn.Linear(self.hidden_dim, max(8, self.hidden_dim // 4)),
+            nn.ReLU(),
+            nn.Linear(max(8, self.hidden_dim // 4), 1),
+        )
+
+        if self.residual:
+            in_dim = 2 * self.horizon + self.num_dc * self.horizon + self.num_regions * self.horizon + self.num_jobs
+            self.base_head = nn.Sequential(
+                nn.Linear(in_dim, self.hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(float(dropout)),
+                nn.Linear(self.hidden_dim, self.out_dim),
+            )
+        else:
+            self.base_head = None
+
+    def _split_xi(self, xi):
+        return _multidc_split_xi(xi, self.horizon, self.num_dc, self.num_regions, self.num_jobs)
+
+    def forward(self, xi):
+        base_load, price, renew, interactive, batch_work = self._split_xi(xi)
+
+        renew_t = renew.transpose(1, 2)
+        interactive_t = interactive.transpose(1, 2)
+        batch_t = batch_work.unsqueeze(1).repeat(1, self.horizon, 1)
+        seq = torch.cat(
+            [
+                base_load.unsqueeze(-1),
+                price.unsqueeze(-1),
+                renew_t,
+                interactive_t,
+                batch_t,
+            ],
+            dim=-1,
+        )
+
+        if self.constraint_feat_inject:
+            feats = _multidc_constraint_features(base_load, price, renew, interactive, batch_work)
+            feat_seq = torch.stack(feats, dim=-1)
+            seq = torch.cat([seq, feat_seq], dim=-1)
+
+        h = seq.transpose(1, 2)
+        h = self.input_proj(h)
+        for block in self.blocks:
+            h = block(h)
+
+        h_flat = h.reshape(h.shape[0], -1)
+        h_pool = h.mean(dim=-1)
+        feas = self.feas_head(h_flat)
+        obj = self.obj_head(h_flat)
+        gate = torch.sigmoid(self.gate_head(h_pool))
+        delta = (1.0 - gate) * feas + gate * obj
+
+        if self.base_head is None:
+            return delta
+        base = self.base_head(xi)
+        return base + self.residual_scale * torch.tanh(delta)
 
 class netFC(nn.Module):
     def __init__(self, input_dim, hidden_dims, output_dim):
