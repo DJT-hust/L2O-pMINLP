@@ -5,7 +5,6 @@ Projection Gradient
 import numpy as np
 import torch
 from torch import nn
-import neuromancer as nm
 
 class gradientProjection(nn.Module):
     def __init__(self, pre_components, post_components, loss_fn, target_key, max_iters=1000, step_size=0.01, decay=1.0):
@@ -24,7 +23,8 @@ class gradientProjection(nn.Module):
         # get target variables
         for comp in self.pre_components:
             input_dict.update(comp(input_dict))
-        x = input_dict[self.target_key]
+        x = input_dict[self.target_key].detach().clone().requires_grad_(True)
+        input_dict[self.target_key] = x
         # project gradient
         for _ in range(self.max_iters):
             # forward pass in components
@@ -38,10 +38,14 @@ class gradientProjection(nn.Module):
             # get gradients
             grad = torch.autograd.grad(viol.sum(), x)[0]
             # update
-            x = x - d * self.step_size * grad
+            x = (x - d * self.step_size * grad).detach().requires_grad_(True)
             d = self.decay * d
             # get data
             input_dict[self.target_key] = x
+        # refresh outputs with projected point
+        for comp in self.post_components:
+            input_dict.update(comp(input_dict))
+        input_dict[self.target_key] = x.detach()
         return input_dict
 
 
