@@ -57,6 +57,12 @@ class penaltyLoss(nn.Module):
         p_cool_slope=None,
         p_cool_bias=None,
         h_cool_max=None,
+        r_th=None,
+        c_th=None,
+        theta_min=None,
+        theta_max=None,
+        theta_init=None,
+        tout_profile=None,
         dc_power_factor=None,
         penalty_weight: float = 40.0,
         eq_weight: float = 1.0,
@@ -112,6 +118,20 @@ class penaltyLoss(nn.Module):
             p_cool_bias = [0.02] * self.num_dc
         if h_cool_max is None:
             h_cool_max = [3.0] * self.num_dc
+        if r_th is None:
+            r_th = [0.6] * self.num_dc
+        if c_th is None:
+            c_th = [3.2] * self.num_dc
+        if theta_min is None:
+            theta_min = [18.0] * self.num_dc
+        if theta_max is None:
+            theta_max = [28.0] * self.num_dc
+        if theta_init is None:
+            theta_init = [23.0] * self.num_dc
+        if tout_profile is None:
+            tgrid = torch.linspace(0.0, 2.0 * torch.pi, steps=self.horizon + 1, dtype=torch.float32)[:-1]
+            tout_profile = 26.0 + 4.0 * torch.sin(tgrid - torch.pi / 3.0)
+            tout_profile = tout_profile.view(1, -1).repeat(self.num_dc, 1)
         if dc_power_factor is None:
             dc_power_factor = [0.95] * self.num_dc
         self.register_buffer("mu_service", torch.as_tensor(mu_service, dtype=torch.float32))
@@ -122,6 +142,12 @@ class penaltyLoss(nn.Module):
         self.register_buffer("p_cool_slope", torch.as_tensor(p_cool_slope, dtype=torch.float32))
         self.register_buffer("p_cool_bias", torch.as_tensor(p_cool_bias, dtype=torch.float32))
         self.register_buffer("h_cool_max", torch.as_tensor(h_cool_max, dtype=torch.float32))
+        self.register_buffer("r_th", torch.as_tensor(r_th, dtype=torch.float32))
+        self.register_buffer("c_th", torch.as_tensor(c_th, dtype=torch.float32))
+        self.register_buffer("theta_min", torch.as_tensor(theta_min, dtype=torch.float32))
+        self.register_buffer("theta_max", torch.as_tensor(theta_max, dtype=torch.float32))
+        self.register_buffer("theta_init", torch.as_tensor(theta_init, dtype=torch.float32))
+        self.register_buffer("tout_profile", torch.as_tensor(tout_profile, dtype=torch.float32))
         self.register_buffer("dc_power_factor", torch.as_tensor(dc_power_factor, dtype=torch.float32))
         self.register_buffer("phi_interactive", torch.as_tensor(phi_interactive, dtype=torch.float32))
         self.register_buffer("switch_cost", torch.as_tensor(switch_cost, dtype=torch.float32))
@@ -393,6 +419,87 @@ class penaltyLoss(nn.Module):
         ineq_viol = ineq_viol + relu(
             li + batch_proc - self.dc_cpu_cap.view(1, self.num_dc, 1) * y
         ).sum(dim=(1, 2))
+
+        # Thermal feasibility proxy: mirror the smooth internal DC temperature dynamics.
+        dt_hour = 5.0 / 60.0
+        kappa = torch.exp(-dt_hour / torch.clamp(self.r_th * self.c_th, min=1.0e-4)).view(1, self.num_dc, 1)
+        h_guess = torch.minimum(
+            torch.clamp(0.6 * (p_dc + self.p_other_dc.view(1, self.num_dc, 1)), min=0.0),
+            self.h_cool_max.view(1, self.num_dc, 1),
+        )
+        p_c = self.p_cool_slope.view(1, self.num_dc, 1) * h_guess + self.p_cool_bias.view(1, self.num_dc, 1)
+        p_it = torch.clamp(p_dc - p_c - self.p_other_dc.view(1, self.num_dc, 1), min=0.0)
+        theta = torch.zeros((x.shape[0], self.num_dc, self.horizon), device=x.device)
+        theta_prev = self.theta_init.view(1, self.num_dc)
+        for t in range(self.horizon):
+            theta[:, :, t] = (
+                kappa.squeeze(-1) * theta_prev
+                + (1.0 - kappa.squeeze(-1)) * self.tout_profile[:, t].view(1, self.num_dc)
+                + self.r_th.view(1, self.num_dc)
+                * (1.0 - kappa.squeeze(-1))
+                * (p_it[:, :, t] + self.p_other_dc.view(1, self.num_dc) - h_guess[:, :, t])
+            )
+            theta_prev = theta[:, :, t]
+        ineq_viol = ineq_viol + relu(theta - self.theta_max.view(1, self.num_dc, 1)).sum(dim=(1, 2))
+        ineq_viol = ineq_viol + relu(self.theta_min.view(1, self.num_dc, 1) - theta).sum(dim=(1, 2))
+
+        # Radial feeder feasibility proxy (LinDistFlow-style).
+        B = x.shape[0]
+        N = self.num_bus
+        E = self.num_branch
+        p_non_dc = self.p_base_share.view(1, N, 1) * base_load.unsqueeze(1)
+        q_non_dc = self.q_base_share.view(1, N, 1) * base_load.unsqueeze(1)
+
+        p_dc_bus = torch.zeros((B, N, self.horizon), device=x.device)
+        q_dc_bus = torch.zeros((B, N, self.horizon), device=x.device)
+        ren_bus = torch.zeros((B, N, self.horizon), device=x.device)
+        for d in range(self.num_dc):
+            bus_idx = int(self.dc_bus_map[d].item())
+            p_dc_bus[:, bus_idx, :] = p_dc_bus[:, bus_idx, :] + p_dc[:, d, :]
+            q_dc_bus[:, bus_idx, :] = q_dc_bus[:, bus_idx, :] + self.dc_reactive_factor * p_dc[:, d, :]
+            ren_bus[:, bus_idx, :] = ren_bus[:, bus_idx, :] + ren_use[:, d, :]
+
+        p_load = p_non_dc + p_dc_bus - ren_bus
+        q_load = q_non_dc + q_dc_bus
+
+        p_subtree = p_load.clone()
+        q_subtree = q_load.clone()
+        for n in self.rev_topo_nodes:
+            p_edge = int(self.parent_edge_of_bus[n].item())
+            if p_edge < 0:
+                continue
+            parent = int(self.branch_from[p_edge].item())
+            p_subtree[:, parent, :] = p_subtree[:, parent, :] + p_subtree[:, n, :]
+            q_subtree[:, parent, :] = q_subtree[:, parent, :] + q_subtree[:, n, :]
+
+        p_flow = torch.zeros((B, E, self.horizon), device=x.device)
+        q_flow = torch.zeros((B, E, self.horizon), device=x.device)
+        for e in range(E):
+            child = int(self.branch_to[e].item())
+            p_flow[:, e, :] = p_subtree[:, child, :]
+            q_flow[:, e, :] = q_subtree[:, child, :]
+
+        root_children = self._children_edges[self.root_bus]
+        p_sub_root = torch.zeros((B, self.horizon), device=x.device)
+        for e in root_children:
+            p_sub_root = p_sub_root + p_flow[:, e, :]
+        eq_viol = eq_viol + ((p_th + p_grid - p_sub_root) ** 2).sum(dim=1)
+
+        v = torch.zeros((B, N, self.horizon), device=x.device)
+        v[:, self.root_bus, :] = 1.0
+        for n in self.topo_nodes:
+            e = int(self.edge_of_child[n].item())
+            if e < 0:
+                continue
+            parent = int(self.branch_from[e].item())
+            v[:, n, :] = v[:, parent, :] - 2.0 * (
+                self.branch_r[e] * p_flow[:, e, :] + self.branch_x[e] * q_flow[:, e, :]
+            )
+        line_lim = self.line_flow_abs_max.view(1, E, 1)
+        ineq_viol = ineq_viol + relu(torch.abs(p_flow) - line_lim).sum(dim=(1, 2))
+        ineq_viol = ineq_viol + relu(torch.abs(q_flow) - line_lim).sum(dim=(1, 2))
+        ineq_viol = ineq_viol + relu(self.v_min_sq - v).sum(dim=(1, 2))
+        ineq_viol = ineq_viol + relu(v - self.v_max_sq).sum(dim=(1, 2))
 
         # Batch completion with deadline.
         valid4 = self.job_valid_mask.view(1, self.num_jobs, 1, self.horizon)

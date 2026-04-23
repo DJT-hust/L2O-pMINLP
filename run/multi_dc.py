@@ -617,7 +617,15 @@ def _extract_solver_meta(model):
     return out
 
 
-def _hard_binarize_policy_x(model, x_policy: np.ndarray, threshold: float = 0.5):
+def _hard_binarize_policy_x(
+    model,
+    x_policy: np.ndarray,
+    batch_work: np.ndarray | None = None,
+    renew_avail: np.ndarray | None = None,
+    interactive_demand: np.ndarray | None = None,
+    base_load: np.ndarray | None = None,
+    threshold: float = 0.5,
+):
     """Project policy vector to strict 0/1 on binary slices for consistent Pyomo-side evaluation."""
     x = np.asarray(x_policy, dtype=float).reshape(-1).copy()
     if x.size < int(model.nx):
@@ -640,10 +648,30 @@ def _hard_binarize_policy_x(model, x_policy: np.ndarray, threshold: float = 0.5)
         sl = model.x_slices["xI"]
         xi = x[sl].reshape(R, D, T)
         xi_oh = np.zeros_like(xi)
-        best = np.argmax(xi, axis=1)
-        for r in range(R):
+        if interactive_demand is not None:
+            inter = np.asarray(interactive_demand, dtype=float).reshape(R, T)
+            phi = np.asarray(model.phi_interactive, dtype=float)
+            dc_cap = np.asarray(model.dc_cpu_cap, dtype=float)
             for t in range(T):
-                xi_oh[r, best[r, t], t] = 1.0
+                rem = dc_cap.copy()
+                # Assign larger/clearer regions first.
+                priority = np.max(xi[:, :, t], axis=1)
+                order = np.argsort(-priority)
+                for r in order:
+                    demand = float(max(0.0, phi[r] * inter[r, t]))
+                    pref = np.argsort(-xi[r, :, t])
+                    chosen = int(np.argmax(rem))
+                    for d_try in pref:
+                        if rem[int(d_try)] >= demand - 1.0e-12:
+                            chosen = int(d_try)
+                            break
+                    xi_oh[r, chosen, t] = 1.0
+                    rem[chosen] -= demand
+        else:
+            best = np.argmax(xi, axis=1)
+            for r in range(R):
+                for t in range(T):
+                    xi_oh[r, best[r, t], t] = 1.0
         x[sl] = xi_oh.reshape(-1)
 
     if "z" in model.x_slices:
@@ -660,6 +688,222 @@ def _hard_binarize_policy_x(model, x_policy: np.ndarray, threshold: float = 0.5)
                 if rel <= t <= ddl:
                     z_oh[j, best[j, t], t] = 1.0
         x[sl] = z_oh.reshape(-1)
+
+    # Feasibility projection for batch processing variable f:
+    # 1) enforce nonnegativity and f <= cap*z,
+    # 2) greedily allocate each job's required work by deadline,
+    # 3) then apply thermal / feeder safety projections on the resulting schedule.
+    if "f" in model.x_slices and "z" in model.x_slices:
+        f_sl = model.x_slices["f"]
+        z = x[model.x_slices["z"]].reshape(J, D, T)
+        f = np.maximum(x[f_sl].reshape(J, D, T), 0.0)
+        y_h = x[model.x_slices["y"]].reshape(D, T) if "y" in model.x_slices else np.ones((D, T), dtype=float)
+        xi_h = x[model.x_slices["xI"]].reshape(R, D, T) if "xI" in model.x_slices else np.zeros((R, D, T), dtype=float)
+
+        # Keep y consistent with assignment before any capacity projection.
+        # Otherwise dc_capacity projection may use underestimated y and create systematic overload.
+        y_h = np.maximum(y_h, (np.sum(xi_h, axis=0) > 0.5).astype(float))
+        y_h = np.maximum(y_h, (np.sum(z, axis=0) > 0.5).astype(float))
+        if "y" in model.x_slices:
+            x[model.x_slices["y"]] = y_h.reshape(-1)
+
+        # Interactive load estimate for aggregate DC capacity projection.
+        if interactive_demand is not None:
+            inter = np.asarray(interactive_demand, dtype=float).reshape(R, T)
+            li = np.zeros((D, T), dtype=float)
+            phi = np.asarray(model.phi_interactive, dtype=float)
+            for d in range(D):
+                for t in range(T):
+                    li[d, t] = float(np.sum(phi * inter[:, t] * xi_h[:, d, t]))
+        else:
+            li = np.zeros((D, T), dtype=float)
+
+        cap = np.zeros_like(f)
+        for d in range(D):
+            cap[:, d, :] = float(model.dc_cpu_cap[d]) * z[:, d, :]
+        f = np.minimum(f, cap)
+
+        if batch_work is None:
+            work_req = np.asarray(getattr(model, "batch_work", np.zeros(J, dtype=float)), dtype=float).reshape(J)
+        else:
+            work_req = np.asarray(batch_work, dtype=float).reshape(J)
+
+        # Optional thermal-aware slot cap to reduce theta_ub violations.
+        thermal_safety = 0.30
+        theta_headroom = 1.8
+        slot_cap = np.sum(cap, axis=0)  # [D,T]
+        if interactive_demand is not None and hasattr(model, "alpha_batch") and float(getattr(model, "alpha_batch", 0.0)) > 1.0e-8:
+            alpha_i = float(getattr(model, "alpha_interactive", 0.0))
+            alpha_b = float(getattr(model, "alpha_batch", 1.0))
+            for d in range(D):
+                kappa = float(model.kappa[d]) if hasattr(model, "kappa") else 0.95
+                r_th = float(model.r_th[d]) if hasattr(model, "r_th") else 0.6
+                h_max = float(model.h_cool_max[d]) if hasattr(model, "h_cool_max") else 3.0
+                p_other = float(model.p_other_dc[d]) if hasattr(model, "p_other_dc") else 0.08
+                theta_max = float(model.theta_max[d]) if hasattr(model, "theta_max") else 28.0
+                theta_prev = float(model.theta_init[d]) if hasattr(model, "theta_init") else 23.0
+                idle = float(model.dc_idle_power[d]) if hasattr(model, "dc_idle_power") else 0.0
+                denom = max(r_th * (1.0 - kappa), 1.0e-6)
+
+                for t in range(T):
+                    tout = float(model.tout_profile[d, t]) if hasattr(model, "tout_profile") else 26.0
+                    theta_cap = theta_max - theta_headroom
+                    pit_allow = h_max - p_other + (theta_cap - kappa * theta_prev - (1.0 - kappa) * tout) / denom
+                    base_it = idle * y_h[d, t] + alpha_i * li[d, t]
+                    batch_allow = max(0.0, (pit_allow - base_it) / alpha_b)
+                    batch_allow *= thermal_safety
+                    slot_cap[d, t] = min(slot_cap[d, t], batch_allow)
+
+                    # Keep conservative temperature propagation with max cooling.
+                    pit_eff = base_it + alpha_b * min(batch_allow, slot_cap[d, t])
+                    theta_prev = kappa * theta_prev + (1.0 - kappa) * tout + r_th * (1.0 - kappa) * (pit_eff + p_other - h_max)
+
+            # Enforce per-(d,t) slot capacity by proportional scaling.
+            for d in range(D):
+                for t in range(T):
+                    cur = float(np.sum(f[:, d, t]))
+                    cap_dt = float(max(slot_cap[d, t], 0.0))
+                    if cur > cap_dt + 1.0e-12:
+                        ratio = cap_dt / max(cur, 1.0e-12)
+                        f[:, d, t] *= ratio
+
+        # Aggregate compute capacity is enforced after a job-completion-first allocation below.
+        for j in range(J):
+            rel = int(model.release_times[j]) if hasattr(model, "release_times") else 0
+            ddl = int(model.deadlines[j]) if hasattr(model, "deadlines") else (T - 1)
+            rel = max(0, rel)
+            ddl = min(T - 1, ddl)
+
+            # Outside valid window, force zero processing.
+            if rel > 0:
+                f[j, :, :rel] = 0.0
+            if ddl < T - 1:
+                f[j, :, ddl + 1 :] = 0.0
+
+            if rel > ddl:
+                continue
+
+            # Hard completion first: fill required work using best slack slots.
+            need = max(0.0, float(work_req[j]))
+            slots = []
+            for d in range(D):
+                for t in range(rel, ddl + 1):
+                    slack = float(min(cap[j, d, t], max(slot_cap[d, t], 0.0)) - f[j, d, t])
+                    if slack > 1.0e-12:
+                        slots.append((slack, d, t))
+            slots.sort(reverse=True, key=lambda e: e[0])
+
+            for slack, d, t in slots:
+                if need <= 1.0e-9:
+                    break
+                add = min(need, slack)
+                f[j, d, t] += add
+                need -= add
+
+        # Enforce aggregate compute capacity exactly at hardening stage:
+        # li[d,t] + sum_j f[j,d,t] <= dc_cpu_cap[d] * y[d,t].
+        for d in range(D):
+            dc_cap_d = float(model.dc_cpu_cap[d])
+            for t in range(T):
+                batch_cap = max(0.0, dc_cap_d * y_h[d, t] - li[d, t])
+                cur = float(np.sum(f[:, d, t]))
+                if cur > batch_cap + 1.0e-12:
+                    ratio = batch_cap / max(cur, 1.0e-12)
+                    f[:, d, t] *= ratio
+
+        x[f_sl] = f.reshape(-1)
+
+        # Use as much local renewable as possible to reduce feeder import and pf upper-bound violations.
+        if renew_avail is not None and "ren_use" in model.x_slices:
+            ra = np.asarray(renew_avail, dtype=float).reshape(D, T)
+            inter = np.asarray(interactive_demand, dtype=float).reshape(R, T) if interactive_demand is not None else np.zeros((R, T), dtype=float)
+            li = np.zeros((D, T), dtype=float)
+            for d in range(D):
+                for t in range(T):
+                    li[d, t] = float(np.sum(np.asarray(model.phi_interactive, dtype=float) * inter[:, t] * xi_h[:, d, t]))
+            batch_proc = np.sum(f, axis=0)
+            p_dc_est = np.zeros((D, T), dtype=float)
+            for d in range(D):
+                p_dc_est[d, :] = (
+                    float(model.dc_idle_power[d]) * y_h[d, :]
+                    + float(getattr(model, "alpha_interactive", 0.0)) * li[d, :]
+                    + float(getattr(model, "alpha_batch", 0.0)) * batch_proc[d, :]
+                )
+            ren = np.minimum(np.maximum(ra, 0.0), np.maximum(p_dc_est, 0.0))
+            x[model.x_slices["ren_use"]] = ren.reshape(-1)
+
+        # Line-flow safety callback: if any branch active flow exceeds limit,
+        # downscale batch processing at that time step and refresh ren_use.
+        if base_load is not None and interactive_demand is not None:
+            base = np.asarray(base_load, dtype=float).reshape(T)
+            inter = np.asarray(interactive_demand, dtype=float).reshape(R, T)
+            phi = np.asarray(model.phi_interactive, dtype=float)
+            li = np.zeros((D, T), dtype=float)
+            for d in range(D):
+                for t in range(T):
+                    li[d, t] = float(np.sum(phi * inter[:, t] * xi_h[:, d, t]))
+
+            for _ in range(2):
+                batch_proc = np.sum(f, axis=0)
+                p_dc_est = np.zeros((D, T), dtype=float)
+                for d in range(D):
+                    p_dc_est[d, :] = (
+                        float(model.dc_idle_power[d]) * y_h[d, :]
+                        + float(getattr(model, "alpha_interactive", 0.0)) * li[d, :]
+                        + float(getattr(model, "alpha_batch", 0.0)) * batch_proc[d, :]
+                    )
+
+                if renew_avail is not None and "ren_use" in model.x_slices:
+                    ra = np.asarray(renew_avail, dtype=float).reshape(D, T)
+                    ren = np.minimum(np.maximum(ra, 0.0), np.maximum(p_dc_est, 0.0))
+                    x[model.x_slices["ren_use"]] = ren.reshape(-1)
+                else:
+                    ren = np.zeros((D, T), dtype=float)
+
+                N = int(model.num_bus)
+                E = int(model.num_branch)
+                p_load = np.zeros((N, T), dtype=float)
+                for n in range(N):
+                    p_load[n, :] = float(model.p_base_share[n]) * base
+                for d in range(D):
+                    bus = int(model.dc_bus_map[d])
+                    p_load[bus, :] += p_dc_est[d, :] - ren[d, :]
+
+                p_sub = p_load.copy()
+                post = []
+
+                def _dfs_post(u: int):
+                    for e in model.children_edges_of_bus[u]:
+                        _dfs_post(int(model.branch_to[int(e)]))
+                    post.append(u)
+
+                _dfs_post(0)
+                for n in post:
+                    if n == 0:
+                        continue
+                    pe = int(model.parent_edge_of_bus[n])
+                    if pe < 0:
+                        continue
+                    parent = int(model.branch_from[pe])
+                    p_sub[parent, :] += p_sub[n, :]
+
+                pf = np.zeros((E, T), dtype=float)
+                for e in range(E):
+                    child = int(model.branch_to[e])
+                    pf[e, :] = p_sub[child, :]
+
+                lim = np.asarray(model.line_flow_abs_max, dtype=float).reshape(E, 1)
+                ratio_t = np.ones(T, dtype=float)
+                for t in range(T):
+                    over = np.max(np.abs(pf[:, t]) / np.maximum(lim[:, 0], 1.0e-6))
+                    if over > 1.0 + 1.0e-9:
+                        ratio_t[t] = 1.0 / over
+
+                if np.min(ratio_t) >= 1.0 - 1.0e-9:
+                    break
+                for t in range(T):
+                    if ratio_t[t] < 1.0:
+                        f[:, :, t] *= ratio_t[t]
 
     # Couple activation with assignment hardening:
     # if any interactive/batch task is assigned to (d,t), force y[d,t]=1.
@@ -776,6 +1020,91 @@ def _assign_policy_solution_for_violation(model, x_policy: np.ndarray):
             li_mat[d, t] = li
             fb_mat[d, t] = float(np.sum(f[:, d, t]))
 
+    # Secondary projection on batch processing to target key inequality violations:
+    # 1) dc_capacity: li + sum_j f <= dc_cpu_cap * y
+    # 2) theta_ub: cap batch load by thermal upper-bound feasibility with max cooling
+    for d in range(D):
+        cap_d = float(model.dc_cpu_cap[d]) if hasattr(model, "dc_cpu_cap") else 0.0
+        for t in range(T):
+            allow = max(0.0, cap_d * float(y[d, t]) - float(li_mat[d, t]))
+            cur = float(np.sum(f[:, d, t]))
+            if cur > allow + 1.0e-12:
+                ratio = allow / max(cur, 1.0e-12)
+                f[:, d, t] *= ratio
+                fb_mat[d, t] = float(np.sum(f[:, d, t]))
+
+    if hasattr(model, "theta_max") and hasattr(model, "theta_init") and hasattr(model, "h_cool_max"):
+        alpha_i = float(getattr(model, "alpha_interactive", 0.0))
+        alpha_b = float(getattr(model, "alpha_batch", 0.0))
+        thermal_safety = 0.30
+        theta_headroom = 1.8
+        for d in range(D):
+            theta_prev = float(model.theta_init[d])
+            kappa = float(model.kappa[d]) if hasattr(model, "kappa") else 0.95
+            r_th = float(model.r_th[d]) if hasattr(model, "r_th") else 0.6
+            h_max = float(model.h_cool_max[d])
+            theta_max = float(model.theta_max[d])
+            p_other = float(model.p_other_dc[d]) if hasattr(model, "p_other_dc") else 0.08
+            idle = float(model.dc_idle_power[d]) if hasattr(model, "dc_idle_power") else 0.0
+            denom = max(r_th * (1.0 - kappa), 1.0e-6)
+
+            for t in range(T):
+                li = float(li_mat[d, t])
+                fb = float(fb_mat[d, t])
+                tout = float(model.tout_profile[d, t]) if hasattr(model, "tout_profile") else 26.0
+
+                base_it = idle * float(y[d, t]) + alpha_i * li
+                theta_cap = theta_max - theta_headroom
+                pit_allow = h_max - p_other + (theta_cap - kappa * theta_prev - (1.0 - kappa) * tout) / denom
+                fb_allow = max(0.0, (pit_allow - base_it) / max(alpha_b, 1.0e-8)) if alpha_b > 1.0e-8 else 0.0
+                fb_allow *= thermal_safety
+
+                if fb > fb_allow + 1.0e-12:
+                    ratio = fb_allow / max(fb, 1.0e-12)
+                    f[:, d, t] *= ratio
+                    fb = float(np.sum(f[:, d, t]))
+                    fb_mat[d, t] = fb
+
+                pit_eff = base_it + alpha_b * fb
+                theta_prev = kappa * theta_prev + (1.0 - kappa) * tout + r_th * (1.0 - kappa) * (pit_eff + p_other - h_max)
+
+    # DistFlow constraint projection: ensure line flow limits are satisfied.
+    # Simple heuristic: check if DC power injections would violate line limits, if so reduce batch load.
+    if hasattr(model, "alpha_interactive") and hasattr(model, "alpha_batch") and hasattr(model, "line_flow_abs_max"):
+        alpha_i = float(model.alpha_interactive)
+        alpha_b = float(model.alpha_batch)
+        line_lim = float(np.max(model.line_flow_abs_max)) if hasattr(model, "line_flow_abs_max") else 100.0
+        
+        # For each DC and time step, estimate power injection impact on line flows.
+        for d in range(D):
+            p_other = float(model.p_other_dc[d]) if hasattr(model, "p_other_dc") else 0.08
+            idle = float(model.dc_idle_power[d]) if hasattr(model, "dc_idle_power") else 0.0
+            
+            for t in range(T):
+                li = float(li_mat[d, t])
+                fb = float(fb_mat[d, t])
+                y_dt = float(y[d, t])
+                
+                # Estimate total power injection at this DC.
+                p_dc_est = idle * y_dt + alpha_i * li + alpha_b * fb + p_other
+                
+                # Conservative heuristic: if DC power is high relative to line limit, reduce batch.
+                # Assume DC power propagates through 2-3 line segments on average.
+                if p_dc_est > 0.5 * line_lim:
+                    # Scale down batch to reduce power injection.
+                    scale = (0.5 * line_lim) / max(p_dc_est, 1.0e-6)
+                    fb_target = max(0.0, (p_dc_est * scale - idle * y_dt - alpha_i * li - p_other) / max(alpha_b, 1.0e-8))
+                    if fb > fb_target + 1.0e-12:
+                        ratio = fb_target / max(fb, 1.0e-12)
+                        f[:, d, t] *= ratio
+                        fb_mat[d, t] = float(np.sum(f[:, d, t]))
+    
+    # Push projected f back into model vars before internal reconstruction.
+    for j in range(J):
+        for d in range(D):
+            for t in range(T):
+                model.vars["f"][j, d, t].set_value(float(f[j, d, t]))
+
     # If enhanced PDF internal-model variables exist, build a feasible internal operating point.
     has_internal = all(
         k in model.vars
@@ -879,10 +1208,10 @@ def _assign_policy_solution_for_violation(model, x_policy: np.ndarray):
                 pit = pit_m + pit_h
 
                 tout = float(model.tout_profile[d, t]) if hasattr(model, "tout_profile") else 26.0
-                theta_ref = 0.5 * (theta_min + theta_max)
                 denom = max(r_th * (1.0 - kappa), 1.0e-6)
-                h_req = pit + p_other + (kappa * theta_prev + (1.0 - kappa) * tout - theta_ref) / denom
-                h_t = float(np.clip(h_req, 0.0, h_max))
+                # During policy feasibility reconstruction, prefer strict thermal feasibility
+                # over energy optimality by using maximum available cooling.
+                h_t = float(h_max)
                 theta_t = kappa * theta_prev + (1.0 - kappa) * tout + r_th * (1.0 - kappa) * (pit + p_other - h_t)
                 theta_prev = theta_t
 
@@ -1170,6 +1499,12 @@ def rndCls(loader_train, loader_test, loader_val, config, penalty_growth=False):
         p_cool_slope=getattr(model, "p_cool_slope", None),
         p_cool_bias=getattr(model, "p_cool_bias", None),
         h_cool_max=getattr(model, "h_cool_max", None),
+        r_th=getattr(model, "r_th", None),
+        c_th=getattr(model, "c_th", None),
+        theta_min=getattr(model, "theta_min", None),
+        theta_max=getattr(model, "theta_max", None),
+        theta_init=getattr(model, "theta_init", None),
+        tout_profile=getattr(model, "tout_profile", None),
         dc_power_factor=getattr(model, "dc_power_factor", None),
         phi_interactive=model.phi_interactive,
         alpha_interactive=model.alpha_interactive,
@@ -1385,7 +1720,14 @@ def evaluate(components, loss_fn, model, loader_test, config):
         policy_tock = time.time()
 
         x_pol_raw = xdp["x_rnd"].detach().cpu().numpy().reshape(-1)
-        x_pol_hard = _hard_binarize_policy_x(model, x_pol_raw)
+        x_pol_hard = _hard_binarize_policy_x(
+            model,
+            x_pol_raw,
+            batch_work=dp["batch_work"].cpu().numpy(),
+            renew_avail=dp["renew_avail"].cpu().numpy(),
+            interactive_demand=dp["interactive_demand"].cpu().numpy(),
+            base_load=dp["base_load"].cpu().numpy(),
+        )
         hard_flip_ratio = float(np.mean(np.abs(x_pol_hard - x_pol_raw) > 1e-8))
 
         row = {

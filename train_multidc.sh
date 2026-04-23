@@ -291,7 +291,7 @@ PYTHONUNBUFFERED=1 "$PYTHON_BIN" -u run_multidc.py \
   --rnn_dropout "$RNN_DROPOUT" \
   --tcn_blocks "$TCN_BLOCKS" \
   --tcn_dropout "$TCN_DROPOUT" \
-  --patience "$PATIENCE" \
+  --patience 9999 \
   --epochs "$EPOCHS" \
   --warmup "$WARMUP" \
   --validate_every "$VALIDATE_EVERY" \
