@@ -90,12 +90,12 @@ class trainer:
         self.components.eval()
         with torch.no_grad():
             # use orignal penalty weight for validation
-            #self.loss_fn.penalty_weight, temp_weight = self.orig_weight, self.loss_fn.penalty_weight
+            self.loss_fn.penalty_weight, temp_weight = self.orig_weight, self.loss_fn.penalty_weight
             # get loss
             val_loss = self.calculate_loss(loader_dev)
             print(f"Epoch {epoch}, Iters {iters}, Training Loss: {train_loss:.2f}, Validation Loss: {val_loss:.2f}")
             # restore weight
-            #self.loss_fn.penalty_weight = temp_weight
+            self.loss_fn.penalty_weight = temp_weight
         # turn into training phase
         self.components.train()
         # start early stop after warmup
